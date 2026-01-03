@@ -1,7 +1,7 @@
 import streamlit as st
 import json
 import os
-import pandas as pd  # 👈 여기가 없어서 에러가 났을 수 있습니다.
+import pandas as pd
 import requests
 import yfinance as yf
 import time
@@ -18,7 +18,7 @@ LOG_FILE = 'debrief.log'
 news_cache = {}
 
 # ---------------------------------------------------------
-# [0] 로그 기록 (에러 추적용)
+# [0] 로그 기록
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -29,15 +29,12 @@ def write_log(msg):
     except: pass
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장 (JSONBin + 로컬)
+# [1] 설정 로드/저장
 # ---------------------------------------------------------
 def get_jsonbin_headers():
     try:
         if "jsonbin" in st.secrets:
-            return {
-                'Content-Type': 'application/json',
-                'X-Master-Key': st.secrets["jsonbin"]["master_key"]
-            }
+            return {'Content-Type': 'application/json', 'X-Master-Key': st.secrets["jsonbin"]["master_key"]}
     except: pass
     return None
 
@@ -80,13 +77,11 @@ def load_config():
     return config
 
 def save_config(config):
-    # JSONBin 저장
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
     if url and headers:
         try: requests.put(url, headers=headers, json=config, timeout=5)
         except: pass
-    # 로컬 백업
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
@@ -134,7 +129,7 @@ def get_integrated_news(ticker, strict_mode=False):
     return collected_items
 
 # ---------------------------------------------------------
-# [3] 백그라운드 봇 (명령어 복구 & 에러 방지)
+# [3] 백그라운드 봇
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
@@ -150,18 +145,41 @@ def start_background_worker():
         try:
             bot = telebot.TeleBot(token)
             
-            # [생존 신고]
-            try:
-                bot.send_message(chat_id, "🤖 시스템 정상 가동 (명령어 복구됨)\n/help를 눌러보세요.")
-            except Exception as e:
-                write_log(f"메시지 전송 실패: {e}")
+            try: bot.send_message(chat_id, "🤖 시스템 알림 포맷 업데이트 완료 (V24)")
+            except: pass
 
-            # ---------------------------
-            # [A] 명령어 핸들러 (반드시 여기에 정의)
-            # ---------------------------
+            # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief V22*\n명령어가 정상 작동 중입니다.", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V24*\n알림 메시지가 더 상세해졌습니다.", parse_mode='Markdown')
+
+            @bot.message_handler(commands=['add', '추가'])
+            def add_cmd(m):
+                try:
+                    parts = m.text.split()
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: `/add 티커`")
+                    t = parts[1].upper()
+                    c = load_config()
+                    if t not in c['tickers']:
+                        c['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
+                        save_config(c)
+                        bot.reply_to(m, f"✅ *{t}* 추가 완료", parse_mode='Markdown')
+                    else: bot.reply_to(m, "이미 존재합니다.")
+                except: pass
+
+            @bot.message_handler(commands=['del', '삭제'])
+            def del_cmd(m):
+                try:
+                    parts = m.text.split()
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: `/del 티커`")
+                    t = parts[1].upper()
+                    c = load_config()
+                    if t in c['tickers']:
+                        del c['tickers'][t]
+                        save_config(c)
+                        bot.reply_to(m, f"🗑️ *{t}* 삭제 완료", parse_mode='Markdown')
+                    else: bot.reply_to(m, "목록에 없습니다.")
+                except: pass
 
             @bot.message_handler(commands=['sec', '공시'])
             def sec_cmd(m):
@@ -238,29 +256,6 @@ def start_background_worker():
                 c = load_config()
                 bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
 
-            @bot.message_handler(commands=['add'])
-            def add_cmd(m):
-                try:
-                    t = m.text.split()[1].upper()
-                    c = load_config()
-                    if t not in c['tickers']:
-                        c['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
-                        save_config(c)
-                        bot.reply_to(m, f"✅ {t} 추가됨")
-                    else: bot.reply_to(m, "이미 있음")
-                except: pass
-
-            @bot.message_handler(commands=['del'])
-            def del_cmd(m):
-                try:
-                    t = m.text.split()[1].upper()
-                    c = load_config()
-                    if t in c['tickers']:
-                        del c['tickers'][t]
-                        save_config(c)
-                        bot.reply_to(m, f"🗑️ {t} 삭제됨")
-                except: pass
-
             @bot.message_handler(commands=['on', 'off'])
             def toggle_cmd(m):
                 is_on = '/on' in m.text
@@ -269,18 +264,18 @@ def start_background_worker():
                 save_config(c)
                 bot.reply_to(m, "🟢 가동" if is_on else "⛔ 정지")
 
-            # [메뉴 등록]
             try:
                 bot.set_my_commands([
-                    BotCommand("sec", "🏛️ 공시 조회"), BotCommand("news", "📰 뉴스 검색"),
-                    BotCommand("p", "💰 현재가"), BotCommand("market", "🌍 시장 현황"),
+                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제"),
+                    BotCommand("sec", "🏛️ 공시"), BotCommand("news", "📰 뉴스"),
+                    BotCommand("p", "💰 현재가"), BotCommand("market", "🌍 시장"),
                     BotCommand("list", "📋 목록"), BotCommand("on", "🟢 켜기"),
                     BotCommand("off", "⛔ 끄기"), BotCommand("help", "❓ 도움말")
                 ])
             except: pass
 
             # ---------------------------
-            # [B] 감시 루프
+            # [B] 감시 루프 (알림 포맷 상세화)
             # ---------------------------
             def monitor_loop():
                 write_log("👀 감시 루프 시작")
@@ -293,12 +288,17 @@ def start_background_worker():
                             with ThreadPoolExecutor(max_workers=5) as exe:
                                 for t, s in cfg['tickers'].items():
                                     exe.submit(analyze_ticker, t, s, cur_token, cur_chat)
-                    except Exception as e: write_log(f"Loop Err: {e}")
+                    except: pass
                     time.sleep(60)
+
+            def send_alert(token, chat_id, title, msg):
+                text = f"🔔 *[{title}]*\n{msg}"
+                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
 
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
+                    # [1] 뉴스/공시
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, strict_mode=True)
@@ -308,25 +308,50 @@ def start_background_worker():
                             should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
                             if should_send:
                                 if len(news_cache[ticker]) > 0:
-                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                                data={"chat_id": chat_id, "text": f"🚨 [속보] {ticker}\n{item['title']}\n{item['link']}"})
+                                    # 상세 포맷: [종목] 뉴스제목
+                                    send_alert(token, chat_id, f"{ticker} 소식", f"{item['title']}\n🔗 [Link]({item['link']})")
                                 news_cache[ticker].add(item['link'])
                     
+                    # [2] 가격/기술적 분석
                     stock = yf.Ticker(ticker)
-                    info = stock.fast_info
-                    curr = info.last_price
-                    prev = info.previous_close
+                    hist = stock.history(period="1y")
+                    if hist.empty: return
+                    
+                    close = hist['Close']
+                    curr = close.iloc[-1]
+                    prev = close.iloc[-2]
+                    
+                    # 가격 급등락 (명확한 구분)
                     if settings.get('가격_3%'):
                         pct = ((curr - prev) / prev) * 100
-                        if abs(pct) >= 3.0:
-                            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                        data={"chat_id": chat_id, "text": f"[{ticker}] 🚀 {pct:.2f}%\n${curr:.2f}"})
+                        if pct >= 3.0:
+                            send_alert(token, chat_id, f"{ticker} 급등 🚀", f"상승폭: +{pct:.2f}%\n현재가: ${curr:.2f}")
+                        elif pct <= -3.0:
+                            send_alert(token, chat_id, f"{ticker} 급락 📉", f"하락폭: {pct:.2f}%\n현재가: ${curr:.2f}")
+
+                    # RSI
+                    if settings.get('RSI'):
+                        delta = close.diff()
+                        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                        rs = gain / loss
+                        rsi = 100 - (100 / (1 + rs)).iloc[-1]
+                        if rsi >= 70: send_alert(token, chat_id, f"{ticker} RSI 과매수 🔥", f"현재 RSI: {rsi:.1f}\n(고점 주의)")
+                        elif rsi <= 30: send_alert(token, chat_id, f"{ticker} RSI 과매도 💧", f"현재 RSI: {rsi:.1f}\n(반등 가능성)")
+
+                    # 골든/데드크로스
+                    if settings.get('MA_크로스'):
+                        ma50 = close.rolling(50).mean()
+                        ma200 = close.rolling(200).mean()
+                        if ma50.iloc[-2] < ma200.iloc[-2] and ma50.iloc[-1] > ma200.iloc[-1]:
+                            send_alert(token, chat_id, f"{ticker} 골든크로스 ✨", "50일선이 200일선을 상향 돌파했습니다.")
+                        elif ma50.iloc[-2] > ma200.iloc[-2] and ma50.iloc[-1] < ma200.iloc[-1]:
+                            send_alert(token, chat_id, f"{ticker} 데드크로스 ☠️", "50일선이 200일선을 하향 돌파했습니다.")
+
                 except: pass
 
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
             t_mon.start()
-            
-            write_log("✅ 폴링 시작")
             bot.infinity_polling(timeout=10, long_polling_timeout=5)
             
         except Exception as e:
@@ -338,7 +363,7 @@ def start_background_worker():
 start_background_worker()
 
 # ---------------------------------------------------------
-# [4] UI (컴팩트 + 에러 방지)
+# [4] UI (컴팩트 디자인)
 # ---------------------------------------------------------
 st.markdown("""
 <style>
@@ -474,7 +499,6 @@ with tab2:
 
     st.markdown("##### Settings")
     if config['tickers']:
-        # [수정] NameError 방지를 위한 try-except 추가
         try:
             data_list = []
             for t, settings in config['tickers'].items():
@@ -483,18 +507,17 @@ with tab2:
                 row['Name'] = st.session_state.get('company_names', {}).get(t, t)
                 data_list.append(row)
             
-            # pd (pandas) 사용 부분
             df = pd.DataFrame(data_list, index=config['tickers'].keys())
-            
             cols_order = ["Name", "감시_ON", "뉴스", "SEC", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
             df = df.reindex(columns=cols_order, fill_value=False)
             
+            # [수정] 설정창 명칭 변경
             column_config = {
                 "Name": st.column_config.TextColumn("Company", disabled=True, width="small"),
                 "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), 
                 "뉴스": st.column_config.CheckboxColumn("📰 뉴스", help="일반/소셜"),
                 "SEC": st.column_config.CheckboxColumn("🏛️ SEC", help="공시"),
-                "가격_3%": st.column_config.CheckboxColumn("📈 급등"), 
+                "가격_3%": st.column_config.CheckboxColumn("📉 등락", help="3% 이상 급등/급락 시 알림"), # 👈 여기 수정됨
                 "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
                 "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), 
                 "RSI": st.column_config.CheckboxColumn("📊 RSI"),
