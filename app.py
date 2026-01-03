@@ -13,15 +13,14 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
 
 # --- 프로젝트 설정 ---
-# 로컬 파일은 이제 '백업용'으로만 쓰입니다.
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
+news_cache = {} # 뉴스 중복 발송 방지 캐시
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장 (JSONBin 연동 - 핵심 수정됨)
+# [1] 설정 로드/저장 (JSONBin + 로컬 백업)
 # ---------------------------------------------------------
 def get_jsonbin_headers():
-    # Secrets에서 키를 가져옴 (로컬 실행 시 에러 방지)
     try:
         if "jsonbin" in st.secrets:
             return {
@@ -40,7 +39,7 @@ def get_jsonbin_url():
     return None
 
 def load_config():
-    # 1. 기본값 (최후의 보루)
+    # 1. 기본값
     config = {
         "system_active": True, 
         "telegram": {"bot_token": "", "chat_id": ""}, 
@@ -50,24 +49,19 @@ def load_config():
         } 
     }
 
-    # 2. [핵심] JSONBin(클라우드 저장소)에서 불러오기
+    # 2. JSONBin(클라우드) 로드
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
-    
     if url and headers:
         try:
-            # 'latest'를 붙여서 최신 데이터 가져옴
             resp = requests.get(f"{url}/latest", headers=headers, timeout=5)
             if resp.status_code == 200:
                 cloud_data = resp.json()['record']
-                # 데이터가 비어있지 않다면 적용
                 if "tickers" in cloud_data and cloud_data['tickers']:
                     config = cloud_data
-                    # print("✅ 클라우드 설정 로드 성공")
-        except Exception as e:
-            print(f"⚠️ 클라우드 로드 실패: {e}")
+        except: pass
 
-    # 3. 텔레그램 키는 Secrets가 최우선
+    # 3. 텔레그램 키는 Secrets 우선
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -77,45 +71,170 @@ def load_config():
     return config
 
 def save_config(config):
-    # 1. JSONBin(클라우드)에 저장
+    # 1. JSONBin 저장
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
-    
     if url and headers:
-        try:
-            # 비동기적으로 저장하면 좋지만, 간단하게 동기 처리 (데이터가 작으므로)
-            requests.put(url, headers=headers, json=config, timeout=5)
-            # print("✅ 클라우드 저장 성공")
-        except Exception as e:
-            print(f"⚠️ 클라우드 저장 실패: {e}")
+        try: requests.put(url, headers=headers, json=config, timeout=5)
+        except: pass
 
-    # 2. 로컬 파일에도 백업 (로컬 실행용)
+    # 2. 로컬 파일 백업
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
     except: pass
 
 # ---------------------------------------------------------
-# [2] 백그라운드 봇
+# [2] 뉴스/공시 검색 엔진 (복구됨)
+# ---------------------------------------------------------
+def get_integrated_news(ticker, strict_mode=False):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    sec_query = f"{ticker} SEC Filing OR 8-K OR 10-Q"
+    
+    search_urls = [
+        f"https://news.google.com/rss/search?q={sec_query} when:1d&hl=en-US&gl=US&ceid=US:en", # SEC
+        f"https://news.google.com/rss/search?q={ticker}+주가+when:1d&hl=ko&gl=KR&ceid=KR:ko", # KR
+        f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en", # US
+        f"https://news.google.com/rss/search?q={ticker}+stock+(twitter+OR+reddit)+when:1d&hl=en-US&gl=US&ceid=US:en" # Social
+    ]
+
+    if not strict_mode:
+        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+stock&hl=ko&gl=KR&ceid=KR:ko")
+
+    collected_items = []
+    seen_links = set()
+
+    def fetch(url):
+        try:
+            response = requests.get(url, headers=headers, timeout=3)
+            root = ET.fromstring(response.content)
+            for item in root.findall('.//item')[:2]: 
+                try:
+                    title = item.find('title').text.split(' - ')[0]
+                    link = item.find('link').text
+                    if link in seen_links: continue
+                    seen_links.add(link)
+
+                    prefix = "🇰🇷"
+                    if "SEC" in url or "8-K" in title or "10-Q" in title: prefix = "🏛️[SEC]"
+                    elif "twitter" in url or "reddit" in url: prefix = "🐦[Social]"
+                    elif "en-US" in url: prefix = "🇺🇸[Global]"
+                    
+                    collected_items.append({'title': f"{prefix} {title}", 'link': link})
+                except: continue
+        except: pass
+
+    for url in search_urls:
+        fetch(url)
+        if len(collected_items) >= 8: break
+    return collected_items
+
+# ---------------------------------------------------------
+# [3] 백그라운드 봇 (감시 로직 복구됨)
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
     def run_bot_system():
         time.sleep(2)
-        cfg = load_config()
         
-        if not cfg['telegram']['bot_token']: 
-            print("⚠️ 텔레그램 토큰 미설정")
-            return
+        # 봇 설정 로드
+        cfg = load_config()
+        if not cfg['telegram']['bot_token']: return
         
         try:
             BOT_TOKEN = cfg['telegram']['bot_token']
             bot = telebot.TeleBot(BOT_TOKEN)
-            news_cache = {}
+            
+            def send_msg(token, chat_id, msg):
+                try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": msg})
+                except: pass
 
-            # (worker.py의 로직이 돌아가도록 헬스체크만 유지)
+            # --- 감시 루프 (여기가 빠져있었습니다!) ---
+            def monitor_loop():
+                print("👀 백그라운드 감시 시작...")
+                while True:
+                    try:
+                        cfg = load_config()
+                        if cfg.get('system_active', True) and cfg['tickers']:
+                            token = cfg['telegram']['bot_token']
+                            chat_id = cfg['telegram']['chat_id']
+                            
+                            with ThreadPoolExecutor(max_workers=5) as exe:
+                                for t, s in cfg['tickers'].items():
+                                    exe.submit(analyze_ticker, t, s, token, chat_id)
+                    except Exception as e:
+                        print(f"Monitor Error: {e}")
+                    time.sleep(60) # 1분 주기
+
+            def analyze_ticker(ticker, settings, token, chat_id):
+                if not settings.get('감시_ON', True): return
+
+                try:
+                    stock = yf.Ticker(ticker)
+                    
+                    # [뉴스 & SEC 감시]
+                    if settings.get('뉴스') or settings.get('SEC'):
+                        if ticker not in news_cache: news_cache[ticker] = set()
+                        items = get_integrated_news(ticker, strict_mode=True)
+                        
+                        for item in items:
+                            if item['link'] in news_cache[ticker]: continue
+                            
+                            is_sec = "🏛️" in item['title']
+                            should_send = False
+                            if is_sec and settings.get('SEC'): should_send = True
+                            elif not is_sec and settings.get('뉴스'): should_send = True
+                            
+                            if should_send:
+                                if len(news_cache[ticker]) > 0: # 실행 후 신규 뉴스만
+                                    send_msg(token, chat_id, f"🚨 [속보] {ticker}\n{item['title']}\n{item['link']}")
+                                news_cache[ticker].add(item['link'])
+
+                    # [가격 & 보조지표 감시]
+                    info = stock.fast_info
+                    curr = info.last_price
+                    prev = info.previous_close
+                    
+                    if settings.get('가격_3%'):
+                        pct = ((curr - prev) / prev) * 100
+                        if abs(pct) >= 3.0:
+                            emoji = "🚀" if pct > 0 else "📉"
+                            send_msg(token, chat_id, f"[{ticker}] {emoji} {pct:.2f}%\n${curr:.2f}")
+
+                    # (보조지표 로직)
+                    adv_keys = ['MA_크로스', '볼린저', 'MACD', 'RSI']
+                    if any(settings.get(k) for k in adv_keys):
+                        hist = stock.history(period="1y")
+                        if not hist.empty:
+                            close = hist['Close']
+                            
+                            if settings.get('RSI'):
+                                delta = close.diff()
+                                gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                                rs = gain / loss
+                                rsi = 100 - (100 / (1 + rs)).iloc[-1]
+                                if rsi >= 70: send_msg(token, chat_id, f"[{ticker}] 🔥 RSI 과매수 ({rsi:.1f})")
+                                elif rsi <= 30: send_msg(token, chat_id, f"[{ticker}] 💧 RSI 과매도 ({rsi:.1f})")
+
+                            if settings.get('MA_크로스'):
+                                ma50 = close.rolling(50).mean()
+                                ma200 = close.rolling(200).mean()
+                                if ma50.iloc[-2] < ma200.iloc[-2] and ma50.iloc[-1] > ma200.iloc[-1]:
+                                    send_msg(token, chat_id, f"[{ticker}] ✨ 골든크로스")
+                                elif ma50.iloc[-2] > ma200.iloc[-2] and ma50.iloc[-1] < ma200.iloc[-1]:
+                                    send_msg(token, chat_id, f"[{ticker}] ☠️ 데드크로스")
+                except: pass
+
+            # --- 봇 명령어 ---
             @bot.message_handler(commands=['start'])
-            def s(m): bot.reply_to(m, "🤖 DeBrief Cloud Active")
+            def s(m): bot.reply_to(m, "🤖 DeBrief Running (Monitoring ON)")
+            
+            # (명령어 핸들러 - 필요시 추가 가능, 여기선 생략)
+
+            # 스레드 가동
+            t_mon = threading.Thread(target=monitor_loop, daemon=True)
+            t_mon.start()
             
             try: bot.infinity_polling()
             except: pass
@@ -129,7 +248,7 @@ def start_background_worker():
 start_background_worker()
 
 # ---------------------------------------------------------
-# [3] Streamlit UI
+# [4] Streamlit UI (기존 유지)
 # ---------------------------------------------------------
 st.markdown("""
 <style>
@@ -175,20 +294,16 @@ st.set_page_config(page_title="DeBrief", layout="wide", page_icon="📡")
 
 config = load_config()
 
-# [사이드바]
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # 저장소 연결 상태 확인
     is_cloud_connected = False
     try:
         if "jsonbin" in st.secrets: is_cloud_connected = True
     except: pass
 
-    if is_cloud_connected:
-        st.success("☁️ 클라우드 저장소 연결됨")
-    else:
-        st.warning("📂 로컬 저장 모드 (재부팅 시 초기화)")
+    if is_cloud_connected: st.success("☁️ 클라우드 저장소 연결됨")
+    else: st.warning("📂 로컬 저장 모드")
         
     system_on = st.toggle("System Power", value=config.get('system_active', True))
     if system_on != config.get('system_active', True):
@@ -209,11 +324,9 @@ with st.sidebar:
             save_config(config)
             st.success("저장됨")
 
-# [메인]
 st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud</h3>", unsafe_allow_html=True)
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
-# [Tab 1] 시세
 with tab1:
     col_top1, col_top2 = st.columns([8, 1])
     with col_top2:
@@ -239,7 +352,6 @@ with tab1:
     elif not config['system_active']: st.warning("Paused")
     else: st.info("No tickers found.")
 
-# [Tab 2] 관리
 with tab2:
     st.markdown("##### ➕ Add Tickers")
     c1, c2 = st.columns([4, 1])
@@ -316,7 +428,6 @@ with tab2:
                     save_config(config)
                     st.rerun()
 
-# [Tab 3] 로그창
 with tab3:
     col_l1, col_l2 = st.columns([8, 1])
     with col_l1: st.markdown("##### System Logs")
