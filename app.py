@@ -13,21 +13,21 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
 
 # --- 프로젝트 설정 ---
-# [중요] 클라우드에서는 파일 저장이 휘발성이므로, 세션 상태를 적극 활용합니다.
 CONFIG_FILE = 'debrief_settings.json'
+LOG_FILE = 'debrief.log'
 
 # ---------------------------------------------------------
-# [1] 설정 로드 함수 (Secrets 우선 확인)
+# [1] 설정 로드 함수 (Secrets 우선 확인 + 파일 백업)
 # ---------------------------------------------------------
 def load_config():
     # 1. 기본 설정 템플릿
     config = {
         "system_active": True, 
         "telegram": {"bot_token": "", "chat_id": ""}, 
-        "tickers": {} # 초기값 비어있음
+        "tickers": {} 
     }
 
-    # 2. [핵심] Streamlit Secrets(금고) 확인
+    # 2. Streamlit Secrets(금고) 확인
     if "telegram" in st.secrets:
         config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
         config['telegram']['chat_id'] = st.secrets["telegram"]["chat_id"]
@@ -37,10 +37,9 @@ def load_config():
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 saved_config = json.load(f)
-                # 티커 정보 등은 파일에서 가져오기
                 if "tickers" in saved_config: 
                     config['tickers'] = saved_config['tickers']
-                # 파일에 키가 있다면 그것도 사용 (Secrets보다 우선순위 낮음 or 높음 선택 가능)
+                # 파일에 저장된 키가 있다면 (로컬 테스트용)
                 if saved_config['telegram']['bot_token']:
                     config['telegram'] = saved_config['telegram']
         except: pass
@@ -48,7 +47,6 @@ def load_config():
     return config
 
 def save_config(config):
-    # 클라우드 환경에서는 이 저장이 영구적이지 않음을 인지해야 함
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
 
@@ -61,9 +59,8 @@ def start_background_worker():
         time.sleep(2)
         cfg = load_config()
         
-        # 토큰 없으면 대기
         if not cfg['telegram']['bot_token']: 
-            print("⚠️ 텔레그램 토큰이 설정되지 않았습니다.")
+            print("⚠️ 텔레그램 토큰 미설정")
             return
         
         try:
@@ -91,7 +88,6 @@ def start_background_worker():
             def monitor_loop():
                 while True:
                     try:
-                        # 매번 최신 설정 로드 (메모리/파일)
                         cfg = load_config()
                         if cfg.get('system_active', True) and cfg['tickers']:
                             token = cfg['telegram']['bot_token']
@@ -111,29 +107,42 @@ def start_background_worker():
                                                     send_msg(token, chat_id, f"🚨 [속보] {t}\n📰 {item['title']}\n{item['link']}")
                                                 news_cache[t].add(item['link'])
                                     
-                                    # 가격
+                                    # 가격 및 기술적 분석
                                     try:
                                         stock = yf.Ticker(t)
                                         info = stock.fast_info
                                         curr = info.last_price
+                                        
                                         if s.get('가격_3%'):
                                             pct = ((curr - info.previous_close)/info.previous_close)*100
                                             if abs(pct) >= 3.0:
                                                 emoji = "🚀" if pct>0 else "📉"
                                                 send_msg(token, chat_id, f"[{t}] {emoji} {pct:.2f}%\n${curr:.2f}")
+
+                                        if any(s.get(k) for k in ['RSI', 'MA_크로스', '볼린저', 'MACD']):
+                                            hist = stock.history(period="1y")
+                                            if not hist.empty:
+                                                close = hist['Close']
+                                                # RSI 예시
+                                                if s.get('RSI'):
+                                                    delta = close.diff()
+                                                    gain = (delta.where(delta>0, 0)).rolling(14).mean()
+                                                    loss = (-delta.where(delta<0, 0)).rolling(14).mean()
+                                                    rs = gain/loss
+                                                    rsi = 100 - (100/(1+rs)).iloc[-1]
+                                                    if rsi >= 70: send_msg(token, chat_id, f"[{t}] 🔥 RSI 과매수 ({rsi:.1f})")
+                                                    elif rsi <= 30: send_msg(token, chat_id, f"[{t}] 💧 RSI 과매도 ({rsi:.1f})")
                                     except: pass
                     except: pass
                     time.sleep(60)
 
-            # 봇 명령어 처리
             @bot.message_handler(commands=['start'])
             def s(m): bot.reply_to(m, "🤖 DeBrief Cloud Active")
             
-            # (봇 명령어들... 기존과 동일하게 작동)
-            
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
             t_mon.start()
-            bot.infinity_polling()
+            try: bot.infinity_polling()
+            except: pass
             
         except Exception as e:
             print(f"Bot Error: {e}")
@@ -161,6 +170,7 @@ st.markdown("""
     .up-theme { background-color: #E6F4EA; color: #137333; border: 1px solid #CEEAD6; }
     .down-theme { background-color: #FCE8E6; color: #C5221F; border: 1px solid #FAD2CF; }
     [data-testid="stDataEditor"] { border: 1px solid #DADCE0 !important; background-color: #FFFFFF !important; }
+    .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] { color: #1A73E8 !important; border-bottom-color: #1A73E8 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -193,12 +203,10 @@ config = load_config()
 # [사이드바]
 with st.sidebar:
     st.header("🎛️ Control Panel")
-    
-    # Secrets 사용 여부 확인
     if "telegram" in st.secrets:
         st.success("🔒 Secrets Key 사용 중")
     else:
-        st.warning("⚠️ Secrets 미설정 (파일 저장 모드)")
+        st.warning("⚠️ Secrets 미설정 (파일 모드)")
         
     system_on = st.toggle("System Power", value=config.get('system_active', True))
     if system_on != config.get('system_active', True):
@@ -217,12 +225,14 @@ with st.sidebar:
             config['telegram']['bot_token'] = bot_token
             config['telegram']['chat_id'] = chat_id
             save_config(config)
-            st.success("저장됨 (재부팅 시 초기화될 수 있음)")
+            st.success("저장됨")
 
 # [메인]
 st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud</h3>", unsafe_allow_html=True)
-tab1, tab2 = st.tabs(["📊 Dashboard", "⚙️ Management"])
+# [복구됨] 탭 3개 (Dashboard, Management, Logs)
+tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
+# [Tab 1] 시세
 with tab1:
     col_top1, col_top2 = st.columns([8, 1])
     with col_top2:
@@ -239,7 +249,7 @@ with tab1:
             html_code = f"""
             <div class="stock-card">
                 <div class="stock-symbol">{ticker}</div>
-                <div class="stock-name">{info['name']}</div>
+                <div class="stock-name" title="{info['name']}">{info['name']}</div>
                 <div class="stock-price-box {theme_class}">
                     ${info['price']:.2f} <span style="font-size:0.8em; margin-left:4px;">{sign}{info['change']:.2f}%</span>
                 </div>
@@ -248,6 +258,7 @@ with tab1:
     elif not config['system_active']: st.warning("Paused")
     else: st.info("No tickers found.")
 
+# [Tab 2] 관리 (버튼 복구됨)
 with tab2:
     st.markdown("##### ➕ Add Tickers")
     c1, c2 = st.columns([4, 1])
@@ -262,6 +273,24 @@ with tab2:
                 st.rerun()
     
     st.markdown("---")
+    # [복구됨] 전체 제어 버튼
+    st.markdown("##### ⚡ Global Controls")
+    c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
+    ALL_KEYS = ["감시_ON", "뉴스", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
+    
+    with c_all_1:
+        if st.button("✅ ALL ON", use_container_width=True):
+            for t in config['tickers']:
+                for key in ALL_KEYS: config['tickers'][t][key] = True
+            save_config(config)
+            st.rerun()
+    with c_all_2:
+        if st.button("⛔ ALL OFF", use_container_width=True):
+            for t in config['tickers']:
+                for key in ALL_KEYS: config['tickers'][t][key] = False
+            save_config(config)
+            st.rerun()
+
     st.markdown("##### Settings")
     if config['tickers']:
         data_list = []
@@ -272,13 +301,15 @@ with tab2:
         df = pd.DataFrame(data_list, index=config['tickers'].keys())
         cols_order = ["Name", "감시_ON", "뉴스", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
         df = df.reindex(columns=cols_order, fill_value=False)
+        
+        # [복구됨] 컬럼 헤더 텍스트 표시
         column_config = {
             "Name": st.column_config.TextColumn("Company", disabled=True, width="small"),
-            "감시_ON": st.column_config.CheckboxColumn("✅"), "뉴스": st.column_config.CheckboxColumn("📰"),
-            "가격_3%": st.column_config.CheckboxColumn("📈"), "거래량_2배": st.column_config.CheckboxColumn("📢"),
-            "52주_신고가": st.column_config.CheckboxColumn("🏆"), "RSI": st.column_config.CheckboxColumn("📊"),
-            "MA_크로스": st.column_config.CheckboxColumn("❌"), "볼린저": st.column_config.CheckboxColumn("🍩"),
-            "MACD": st.column_config.CheckboxColumn("🌊")
+            "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), "뉴스": st.column_config.CheckboxColumn("📰 뉴스"),
+            "가격_3%": st.column_config.CheckboxColumn("📈 급등"), "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
+            "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), "RSI": st.column_config.CheckboxColumn("📊 RSI"),
+            "MA_크로스": st.column_config.CheckboxColumn("❌ MA"), "볼린저": st.column_config.CheckboxColumn("🍩 볼린저"),
+            "MACD": st.column_config.CheckboxColumn("🌊 MACD")
         }
         edited_df = st.data_editor(df, column_config=column_config, use_container_width=True, key="ticker_editor")
         if not df.equals(edited_df):
@@ -299,3 +330,15 @@ with tab2:
                         if t in config['tickers']: del config['tickers'][t]
                     save_config(config)
                     st.rerun()
+
+# [복구됨] Tab 3 로그창
+with tab3:
+    col_l1, col_l2 = st.columns([8, 1])
+    with col_l1: st.markdown("##### System Logs")
+    with col_l2: 
+        if st.button("Reload Logs"): st.rerun()
+        
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            for line in reversed(f.readlines()[-50:]): 
+                st.markdown(f"<div style='font-family: monospace; color: #444; font-size: 0.85em; border-bottom:1px solid #eee;'>{line.strip()}</div>", unsafe_allow_html=True)
