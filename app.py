@@ -15,7 +15,7 @@ from telebot.types import BotCommand
 # --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
-news_cache = {} # 뉴스 중복 발송 방지 캐시
+news_cache = {} 
 
 # ---------------------------------------------------------
 # [1] 설정 로드/저장 (JSONBin + 로컬 백업)
@@ -130,7 +130,7 @@ def get_integrated_news(ticker, strict_mode=False):
     return collected_items
 
 # ---------------------------------------------------------
-# [3] 백그라운드 봇 시스템 (명령어 복구 완료)
+# [3] 백그라운드 봇 시스템
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
@@ -147,12 +147,31 @@ def start_background_worker():
                 try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": msg})
                 except: pass
 
-            # -------------------------------------------
-            # [A] 명령어 핸들러 (여기가 복구된 부분입니다!)
-            # -------------------------------------------
+            # ===========================================
+            # [A] 봇 메뉴 설정 (설명창 모두 추가됨)
+            # ===========================================
+            try:
+                bot.set_my_commands([
+                    BotCommand("sec", "🏛️ 공시 조회 (8-K/10-Q)"),
+                    BotCommand("news", "📰 뉴스/소셜 통합 검색"),
+                    BotCommand("info", "🏢 기업 펀더멘털 분석"),
+                    BotCommand("p", "💰 현재가 조회"),
+                    BotCommand("market", "🌍 주요 지수/환율 현황"),
+                    BotCommand("list", "📋 감시 중인 종목 목록"),
+                    BotCommand("add", "➕ 감시 종목 추가"),
+                    BotCommand("del", "🗑️ 감시 종목 삭제"),
+                    BotCommand("on", "🟢 감시 시스템 가동"),
+                    BotCommand("off", "⛔ 감시 시스템 정지"),
+                    BotCommand("help", "❓ 도움말")
+                ])
+            except: pass
+
+            # ===========================================
+            # [B] 명령어 핸들러 (모든 명령어 복구)
+            # ===========================================
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 DeBrief Active\n명령어: /sec, /news, /info, /p, /market, /list")
+                bot.reply_to(m, "🤖 *DeBrief V19*\n모든 명령어가 복구되었습니다. 메뉴를 확인하세요.", parse_mode='Markdown')
 
             @bot.message_handler(commands=['sec', '공시'])
             def sec_cmd(message):
@@ -203,9 +222,10 @@ def start_background_worker():
                         v = i.get(k)
                         return f"{v*m:.2f}{u}" if v else "N/A"
                         
-                    res = (f"🏢 *{i.get('shortName', t)}*\nPER: `{val('trailingPE')}` | PBR: `{val('priceToBook')}`\n"
-                           f"배당: `{val('dividendYield', '%', 100)}` | 목표: `${val('targetMeanPrice')}`\n"
-                           f"의견: *{i.get('recommendationKey', 'none').upper()}*")
+                    res = (f"🏢 *{i.get('shortName', t)}*\n"
+                           f"📊 PER: `{val('trailingPE')}` | PBR: `{val('priceToBook')}`\n"
+                           f"💰 배당: `{val('dividendYield', '%', 100)}` | 목표: `${val('targetMeanPrice')}`\n"
+                           f"📢 의견: *{i.get('recommendationKey', 'none').upper()}*")
                     bot.edit_message_text(res, message.chat.id, msg.message_id, parse_mode='Markdown')
                 except: pass
 
@@ -217,16 +237,17 @@ def start_background_worker():
                     bot.reply_to(m, f"💰 {t}: ${p:.2f}")
                 except: pass
 
+            # [복구됨] 시장 현황
             @bot.message_handler(commands=['market'])
             def market_cmd(m):
                 try:
                     idx = {"S&P500":"^GSPC", "Nasdaq":"^IXIC", "VIX":"^VIX", "USD/KRW":"KRW=X"}
-                    txt = "🌍 *Market*\n"
+                    txt = "🌍 *Market Status*\n"
                     for n, t in idx.items():
                         i = yf.Ticker(t).fast_info
                         curr = i.last_price
                         pct = ((curr-i.previous_close)/i.previous_close)*100
-                        em = "🔺" if pct>=0 else "bla"
+                        em = "🔺" if pct>=0 else "🔹"
                         txt += f"{em} {n}: `{curr:.2f}` ({pct:.2f}%)\n"
                     bot.reply_to(m, txt, parse_mode='Markdown')
                 except: pass
@@ -259,8 +280,18 @@ def start_background_worker():
                         bot.reply_to(m, f"🗑️ {t} 삭제됨")
                 except: pass
 
+            # [복구됨] 시스템 ON/OFF
+            @bot.message_handler(commands=['on', 'off'])
+            def toggle_cmd(m):
+                is_on = '/on' in m.text
+                c = load_config()
+                c['system_active'] = is_on
+                save_config(c)
+                status = "🟢 가동 시작" if is_on else "⛔ 시스템 정지"
+                bot.reply_to(m, status)
+
             # -------------------------------------------
-            # [B] 자동 감시 루프
+            # [C] 자동 감시 루프
             # -------------------------------------------
             def monitor_loop():
                 print("👀 백그라운드 감시 시작...")
@@ -306,7 +337,7 @@ def start_background_worker():
                             emoji = "🚀" if pct > 0 else "📉"
                             send_msg(token, chat_id, f"[{ticker}] {emoji} {pct:.2f}%\n${curr:.2f}")
 
-                    # 보조지표 (RSI 등)
+                    # 보조지표
                     if any(settings.get(k) for k in ['MA_크로스', '볼린저', 'MACD', 'RSI']):
                         hist = stock.history(period="1y")
                         if not hist.empty:
@@ -327,15 +358,6 @@ def start_background_worker():
                                 elif ma50.iloc[-2] > ma200.iloc[-2] and ma50.iloc[-1] < ma200.iloc[-1]:
                                     send_msg(token, chat_id, f"[{ticker}] ☠️ 데드크로스")
                 except: pass
-
-            # 봇 메뉴 등록
-            try:
-                bot.set_my_commands([
-                    BotCommand("sec", "🏛️ 공시"), BotCommand("news", "📰 뉴스"), 
-                    BotCommand("info", "🏢 정보"), BotCommand("p", "💰 현재가"), 
-                    BotCommand("list", "📋 목록"), BotCommand("market", "🌍 시장")
-                ])
-            except: pass
 
             # 스레드 시작
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
