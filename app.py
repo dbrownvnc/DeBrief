@@ -11,12 +11,14 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
+# [NEW] 번역 라이브러리
+from deep_translator import GoogleTranslator
 
 # --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
-news_cache = {}       # 뉴스 중복 방지용
-price_alert_cache = {} # [NEW] 가격 알림 중복 방지용 (티커: 마지막알림%)
+news_cache = {}
+price_alert_cache = {}
 
 # ---------------------------------------------------------
 # [0] 로그 기록
@@ -48,7 +50,6 @@ def get_jsonbin_url():
     return None
 
 def load_config():
-    # 1. 기본값
     config = {
         "system_active": True, 
         "telegram": {"bot_token": "", "chat_id": ""}, 
@@ -57,7 +58,6 @@ def load_config():
             "NVDA": {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
         } 
     }
-    # 2. JSONBin
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
     if url and headers:
@@ -68,7 +68,6 @@ def load_config():
                 if "tickers" in cloud_data and cloud_data['tickers']:
                     config = cloud_data
         except: pass
-    # 3. Secrets
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -88,7 +87,7 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 뉴스 검색 엔진
+# [2] 뉴스 검색 엔진 (번역 기능 추가됨)
 # ---------------------------------------------------------
 def get_integrated_news(ticker, strict_mode=False):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -104,6 +103,9 @@ def get_integrated_news(ticker, strict_mode=False):
 
     collected_items = []
     seen_links = set()
+    
+    # [NEW] 번역기 초기화
+    translator = GoogleTranslator(source='auto', target='ko')
 
     def fetch(url):
         try:
@@ -115,10 +117,28 @@ def get_integrated_news(ticker, strict_mode=False):
                     link = item.find('link').text
                     if link in seen_links: continue
                     seen_links.add(link)
+                    
                     prefix = "🇰🇷"
-                    if "SEC" in url or "8-K" in title or "10-Q" in title: prefix = "🏛️[SEC]"
-                    elif "twitter" in url or "reddit" in url: prefix = "🐦[Social]"
-                    elif "en-US" in url: prefix = "🇺🇸[Global]"
+                    is_foreign = False
+                    
+                    if "SEC" in url or "8-K" in title or "10-Q" in title: 
+                        prefix = "🏛️[SEC]"
+                        is_foreign = True
+                    elif "twitter" in url or "reddit" in url: 
+                        prefix = "🐦[Social]"
+                        is_foreign = True
+                    elif "en-US" in url: 
+                        prefix = "🇺🇸[Global]"
+                        is_foreign = True
+                    
+                    # [NEW] 외국 뉴스면 제목 번역 시도
+                    if is_foreign:
+                        try:
+                            # 100자 이내로 잘라서 번역 (속도 최적화)
+                            translated_title = translator.translate(title[:100])
+                            title = f"{translated_title} (원문: {title})"
+                        except: pass # 번역 실패시 원문 유지
+
                     collected_items.append({'title': f"{prefix} {title}", 'link': link})
                 except: continue
         except: pass
@@ -144,14 +164,13 @@ def start_background_worker():
         
         try:
             bot = telebot.TeleBot(token)
-            
-            try: bot.send_message(chat_id, "🤖 시스템 알림 최적화 완료 (V25)\n중복 알림이 제거됩니다.")
+            try: bot.send_message(chat_id, "🤖 시스템 업데이트 (V26)\n이제 영어 뉴스 제목을 한글로 번역해드립니다.")
             except: pass
 
             # --- 명령어 핸들러 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief V25*\n스마트 알림 필터 가동 중.", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V26* (번역기 탑재)\n뉴스 검색 시 제목을 한글로 보여줍니다.", parse_mode='Markdown')
 
             @bot.message_handler(commands=['add', '추가'])
             def add_cmd(m):
@@ -203,7 +222,7 @@ def start_background_worker():
             def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    bot.reply_to(m, f"🔍 {t} 뉴스 검색...")
+                    bot.reply_to(m, f"🔍 {t} 뉴스 검색 (번역 중)...")
                     data = get_integrated_news(t)
                     if not data: bot.reply_to(m, "❌ 뉴스 없음")
                     else:
@@ -222,6 +241,7 @@ def start_background_worker():
                     stock = yf.Ticker(t)
                     try: i = stock.info
                     except: return bot.edit_message_text("⚠️ 정보 접근 불가", message.chat.id, msg.message_id)
+                    
                     def val(k, u="", m=1): 
                         v = i.get(k)
                         return f"{v*m:.2f}{u}" if v else "N/A"
@@ -273,7 +293,7 @@ def start_background_worker():
                 ])
             except: pass
 
-            # --- 감시 루프 & 알림 발송 ---
+            # --- 감시 루프 ---
             def send_alert(token, chat_id, title, msg):
                 text = f"🔔 *[{title}]*\n{msg}"
                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
@@ -295,7 +315,7 @@ def start_background_worker():
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
-                    # [1] 뉴스/공시
+                    # [1] 뉴스/공시 (번역 적용)
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, strict_mode=True)
@@ -308,31 +328,24 @@ def start_background_worker():
                                     send_alert(token, chat_id, f"{ticker} 소식", f"{item['title']}\n🔗 [Link]({item['link']})")
                                 news_cache[ticker].add(item['link'])
                     
-                    # [2] 가격 분석 (스마트 필터 적용)
+                    # [2] 가격 (스마트 필터)
                     stock = yf.Ticker(ticker)
                     hist = stock.history(period="1y")
                     if hist.empty: return
-                    
                     close = hist['Close']
                     curr = close.iloc[-1]
                     prev = close.iloc[-2]
                     
                     if settings.get('가격_3%'):
                         pct = ((curr - prev) / prev) * 100
-                        # 3% 이상 변동 시 체크
                         if abs(pct) >= 3.0:
-                            # 중복 방지 로직: 이전 알림 대비 1% 이상 움직였을 때만 다시 알림
                             last_pct = price_alert_cache.get(ticker, 0.0)
                             if abs(pct - last_pct) >= 1.0: 
-                                if pct > 0:
-                                    send_alert(token, chat_id, f"{ticker} 급등 🚀", f"상승폭: +{pct:.2f}%\n현재가: ${curr:.2f}")
-                                else:
-                                    send_alert(token, chat_id, f"{ticker} 급락 📉", f"하락폭: {pct:.2f}%\n현재가: ${curr:.2f}")
-                                
-                                # 알림 보낸 % 기록
+                                direction = "급등 🚀" if pct > 0 else "급락 📉"
+                                send_alert(token, chat_id, f"{ticker} {direction}", f"변동폭: {pct:.2f}%\n현재가: ${curr:.2f}")
                                 price_alert_cache[ticker] = pct
 
-                    # 보조지표 (기존 유지)
+                    # 보조지표 (RSI 등)
                     if settings.get('RSI'):
                         delta = close.diff()
                         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -346,9 +359,9 @@ def start_background_worker():
                         ma50 = close.rolling(50).mean()
                         ma200 = close.rolling(200).mean()
                         if ma50.iloc[-2] < ma200.iloc[-2] and ma50.iloc[-1] > ma200.iloc[-1]:
-                            send_alert(token, chat_id, f"{ticker} 골든크로스 ✨", "50일선 돌파 (상승반전 가능성)")
+                            send_alert(token, chat_id, f"{ticker} 골든크로스 ✨", "50일선 돌파")
                         elif ma50.iloc[-2] > ma200.iloc[-2] and ma50.iloc[-1] < ma200.iloc[-1]:
-                            send_alert(token, chat_id, f"{ticker} 데드크로스 ☠️", "50일선 이탈 (하락반전 주의)")
+                            send_alert(token, chat_id, f"{ticker} 데드크로스 ☠️", "50일선 이탈")
 
                 except: pass
 
