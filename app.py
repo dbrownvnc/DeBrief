@@ -15,7 +15,7 @@ from telebot.types import BotCommand
 # --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
-news_cache = {} # 뉴스 중복 발송 방지 캐시
+news_cache = {} 
 
 # ---------------------------------------------------------
 # [1] 설정 로드/저장 (JSONBin + 로컬 백업)
@@ -130,7 +130,7 @@ def get_integrated_news(ticker, strict_mode=False):
     return collected_items
 
 # ---------------------------------------------------------
-# [3] 백그라운드 봇 시스템
+# [3] 백그라운드 봇 시스템 (명령어 & 메뉴 복구됨)
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
@@ -147,20 +147,31 @@ def start_background_worker():
                 try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": msg})
                 except: pass
 
-            # [A] 봇 메뉴
+            # ===========================================
+            # [A] 봇 메뉴 설정 (설명 복구 완료)
+            # ===========================================
             try:
                 bot.set_my_commands([
-                    BotCommand("sec", "🏛️ 공시 조회"), BotCommand("news", "📰 뉴스"), 
-                    BotCommand("info", "🏢 정보"), BotCommand("p", "💰 현재가"), 
-                    BotCommand("market", "🌍 시장"), BotCommand("list", "📋 목록"),
+                    BotCommand("sec", "🏛️ 공시 조회 (8-K/10-Q)"),
+                    BotCommand("news", "📰 뉴스/소셜 통합 검색"),
+                    BotCommand("info", "🏢 기업 펀더멘털 분석"),
+                    BotCommand("p", "💰 현재가 조회"),
+                    BotCommand("market", "🌍 주요 지수/환율 현황"),
+                    BotCommand("list", "📋 감시 중인 종목 목록"),
+                    BotCommand("add", "➕ 감시 종목 추가"),
+                    BotCommand("del", "🗑️ 감시 종목 삭제"),
+                    BotCommand("on", "🟢 감시 시스템 가동"),
+                    BotCommand("off", "⛔ 감시 시스템 정지"),
                     BotCommand("help", "❓ 도움말")
                 ])
             except: pass
 
-            # [B] 명령어 핸들러
+            # ===========================================
+            # [B] 명령어 핸들러 (모든 기능 복구 완료)
+            # ===========================================
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief Active*\n명령어: /sec, /news, /info, /p, /market", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V20*\n모든 명령어와 메뉴가 복구되었습니다.", parse_mode='Markdown')
 
             @bot.message_handler(commands=['sec', '공시'])
             def sec_cmd(message):
@@ -169,6 +180,7 @@ def start_background_worker():
                     if len(parts) < 2: return bot.reply_to(message, "사용법: `/sec 티커`")
                     t = parts[1].upper()
                     bot.reply_to(message, f"🏛️ *{t}* 공시 검색 중...", parse_mode='Markdown')
+                    
                     url = f"https://news.google.com/rss/search?q={t}+SEC+Filing+OR+8-K+OR+10-Q&hl=en-US&gl=US&ceid=US:en"
                     response = requests.get(url, timeout=5)
                     root = ET.fromstring(response.content)
@@ -178,9 +190,9 @@ def start_background_worker():
                         link = item.find('link').text
                         pubDate = item.find('pubDate').text[:16]
                         items.append(f"📅 {pubDate}\n📄 [{title}]({link})")
-                    if not items: return bot.reply_to(message, f"❌ {t} 공시 없음")
+                    if not items: return bot.reply_to(message, f"❌ {t} 최근 공시 없음")
                     bot.reply_to(message, f"🏛️ *{t} Filings*\n\n" + "\n\n".join(items), parse_mode='Markdown', disable_web_page_preview=True)
-                except: pass
+                except: bot.reply_to(message, "오류 발생")
 
             @bot.message_handler(commands=['news'])
             def news_cmd(m):
@@ -225,6 +237,7 @@ def start_background_worker():
                     bot.reply_to(m, f"💰 {t}: ${p:.2f}")
                 except: pass
 
+            # [복구됨] 시장 현황
             @bot.message_handler(commands=['market'])
             def market_cmd(m):
                 try:
@@ -267,6 +280,7 @@ def start_background_worker():
                         bot.reply_to(m, f"🗑️ {t} 삭제됨")
                 except: pass
 
+            # [복구됨] 시스템 ON/OFF
             @bot.message_handler(commands=['on', 'off'])
             def toggle_cmd(m):
                 is_on = '/on' in m.text
@@ -276,7 +290,9 @@ def start_background_worker():
                 status = "🟢 가동 시작" if is_on else "⛔ 시스템 정지"
                 bot.reply_to(m, status)
 
+            # -------------------------------------------
             # [C] 자동 감시 루프
+            # -------------------------------------------
             def monitor_loop():
                 print("👀 백그라운드 감시 시작...")
                 while True:
@@ -285,6 +301,7 @@ def start_background_worker():
                         if cfg.get('system_active', True) and cfg['tickers']:
                             token = cfg['telegram']['bot_token']
                             chat_id = cfg['telegram']['chat_id']
+                            
                             with ThreadPoolExecutor(max_workers=5) as exe:
                                 for t, s in cfg['tickers'].items():
                                     exe.submit(analyze_ticker, t, s, token, chat_id)
@@ -296,6 +313,7 @@ def start_background_worker():
                 try:
                     stock = yf.Ticker(ticker)
                     
+                    # 뉴스 & SEC 감시
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, strict_mode=True)
@@ -303,11 +321,13 @@ def start_background_worker():
                             if item['link'] in news_cache[ticker]: continue
                             is_sec = "🏛️" in item['title']
                             should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
+                            
                             if should_send:
                                 if len(news_cache[ticker]) > 0:
                                     send_msg(token, chat_id, f"🚨 [속보] {ticker}\n{item['title']}\n{item['link']}")
                                 news_cache[ticker].add(item['link'])
 
+                    # 가격 감시
                     info = stock.fast_info
                     curr = info.last_price
                     prev = info.previous_close
@@ -317,6 +337,7 @@ def start_background_worker():
                             emoji = "🚀" if pct > 0 else "📉"
                             send_msg(token, chat_id, f"[{ticker}] {emoji} {pct:.2f}%\n${curr:.2f}")
 
+                    # 보조지표
                     if any(settings.get(k) for k in ['MA_크로스', '볼린저', 'MACD', 'RSI']):
                         hist = stock.history(period="1y")
                         if not hist.empty:
@@ -338,8 +359,10 @@ def start_background_worker():
                                     send_msg(token, chat_id, f"[{ticker}] ☠️ 데드크로스")
                 except: pass
 
+            # 스레드 시작
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
             t_mon.start()
+            
             try: bot.infinity_polling()
             except: pass
             
@@ -351,7 +374,7 @@ def start_background_worker():
 start_background_worker()
 
 # ---------------------------------------------------------
-# [4] Streamlit UI (수정됨: 컴팩트 디자인)
+# [4] Streamlit UI (컴팩트 디자인 유지)
 # ---------------------------------------------------------
 st.markdown("""
 <style>
@@ -360,12 +383,11 @@ st.markdown("""
     /* 컴팩트 카드 디자인 */
     .stock-card {
         background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px;
-        padding: 8px 5px; margin-bottom: 6px; text-align: center; /* 패딩 축소 */
+        padding: 8px 5px; margin-bottom: 6px; text-align: center;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05); transition: transform 0.2s;
     }
     .stock-card:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
     
-    /* 폰트 크기 축소 */
     .stock-symbol { font-family: 'Inter', sans-serif; font-size: 1.0em; font-weight: 800; color: #1A73E8; margin-bottom: 2px; }
     .stock-name { font-size: 0.65em; color: #5F6368; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
     .stock-price-box { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; font-weight: 700; }
@@ -445,7 +467,7 @@ with tab1:
     if config['tickers'] and config['system_active']:
         ticker_list = list(config['tickers'].keys())
         stock_data = get_stock_data(ticker_list)
-        # [수정] 한 줄에 8개씩 배치하여 사이즈 줄임
+        # [수정] 한 줄에 8개씩 배치
         cols = st.columns(8)
         for i, ticker in enumerate(ticker_list):
             info = stock_data.get(ticker, {"name": ticker, "price":0, "change":0})
