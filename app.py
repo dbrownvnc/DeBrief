@@ -15,7 +15,8 @@ from telebot.types import BotCommand
 # --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
-news_cache = {}
+news_cache = {}       # 뉴스 중복 방지용
+price_alert_cache = {} # [NEW] 가격 알림 중복 방지용 (티커: 마지막알림%)
 
 # ---------------------------------------------------------
 # [0] 로그 기록
@@ -56,7 +57,7 @@ def load_config():
             "NVDA": {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
         } 
     }
-    # 2. JSONBin 로드
+    # 2. JSONBin
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
     if url and headers:
@@ -67,8 +68,7 @@ def load_config():
                 if "tickers" in cloud_data and cloud_data['tickers']:
                     config = cloud_data
         except: pass
-
-    # 3. Secrets 우선 적용
+    # 3. Secrets
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -145,13 +145,13 @@ def start_background_worker():
         try:
             bot = telebot.TeleBot(token)
             
-            try: bot.send_message(chat_id, "🤖 시스템 알림 포맷 업데이트 완료 (V24)")
+            try: bot.send_message(chat_id, "🤖 시스템 알림 최적화 완료 (V25)\n중복 알림이 제거됩니다.")
             except: pass
 
-            # --- 명령어 ---
+            # --- 명령어 핸들러 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief V24*\n알림 메시지가 더 상세해졌습니다.", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V25*\n스마트 알림 필터 가동 중.", parse_mode='Markdown')
 
             @bot.message_handler(commands=['add', '추가'])
             def add_cmd(m):
@@ -222,7 +222,6 @@ def start_background_worker():
                     stock = yf.Ticker(t)
                     try: i = stock.info
                     except: return bot.edit_message_text("⚠️ 정보 접근 불가", message.chat.id, msg.message_id)
-                    
                     def val(k, u="", m=1): 
                         v = i.get(k)
                         return f"{v*m:.2f}{u}" if v else "N/A"
@@ -274,9 +273,11 @@ def start_background_worker():
                 ])
             except: pass
 
-            # ---------------------------
-            # [B] 감시 루프 (알림 포맷 상세화)
-            # ---------------------------
+            # --- 감시 루프 & 알림 발송 ---
+            def send_alert(token, chat_id, title, msg):
+                text = f"🔔 *[{title}]*\n{msg}"
+                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+
             def monitor_loop():
                 write_log("👀 감시 루프 시작")
                 while True:
@@ -291,10 +292,6 @@ def start_background_worker():
                     except: pass
                     time.sleep(60)
 
-            def send_alert(token, chat_id, title, msg):
-                text = f"🔔 *[{title}]*\n{msg}"
-                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
@@ -308,11 +305,10 @@ def start_background_worker():
                             should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
                             if should_send:
                                 if len(news_cache[ticker]) > 0:
-                                    # 상세 포맷: [종목] 뉴스제목
                                     send_alert(token, chat_id, f"{ticker} 소식", f"{item['title']}\n🔗 [Link]({item['link']})")
                                 news_cache[ticker].add(item['link'])
                     
-                    # [2] 가격/기술적 분석
+                    # [2] 가격 분석 (스마트 필터 적용)
                     stock = yf.Ticker(ticker)
                     hist = stock.history(period="1y")
                     if hist.empty: return
@@ -321,32 +317,38 @@ def start_background_worker():
                     curr = close.iloc[-1]
                     prev = close.iloc[-2]
                     
-                    # 가격 급등락 (명확한 구분)
                     if settings.get('가격_3%'):
                         pct = ((curr - prev) / prev) * 100
-                        if pct >= 3.0:
-                            send_alert(token, chat_id, f"{ticker} 급등 🚀", f"상승폭: +{pct:.2f}%\n현재가: ${curr:.2f}")
-                        elif pct <= -3.0:
-                            send_alert(token, chat_id, f"{ticker} 급락 📉", f"하락폭: {pct:.2f}%\n현재가: ${curr:.2f}")
+                        # 3% 이상 변동 시 체크
+                        if abs(pct) >= 3.0:
+                            # 중복 방지 로직: 이전 알림 대비 1% 이상 움직였을 때만 다시 알림
+                            last_pct = price_alert_cache.get(ticker, 0.0)
+                            if abs(pct - last_pct) >= 1.0: 
+                                if pct > 0:
+                                    send_alert(token, chat_id, f"{ticker} 급등 🚀", f"상승폭: +{pct:.2f}%\n현재가: ${curr:.2f}")
+                                else:
+                                    send_alert(token, chat_id, f"{ticker} 급락 📉", f"하락폭: {pct:.2f}%\n현재가: ${curr:.2f}")
+                                
+                                # 알림 보낸 % 기록
+                                price_alert_cache[ticker] = pct
 
-                    # RSI
+                    # 보조지표 (기존 유지)
                     if settings.get('RSI'):
                         delta = close.diff()
                         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
                         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
                         rs = gain / loss
                         rsi = 100 - (100 / (1 + rs)).iloc[-1]
-                        if rsi >= 70: send_alert(token, chat_id, f"{ticker} RSI 과매수 🔥", f"현재 RSI: {rsi:.1f}\n(고점 주의)")
-                        elif rsi <= 30: send_alert(token, chat_id, f"{ticker} RSI 과매도 💧", f"현재 RSI: {rsi:.1f}\n(반등 가능성)")
+                        if rsi >= 70: send_alert(token, chat_id, f"{ticker} RSI 과매수 🔥", f"RSI: {rsi:.1f}")
+                        elif rsi <= 30: send_alert(token, chat_id, f"{ticker} RSI 과매도 💧", f"RSI: {rsi:.1f}")
 
-                    # 골든/데드크로스
                     if settings.get('MA_크로스'):
                         ma50 = close.rolling(50).mean()
                         ma200 = close.rolling(200).mean()
                         if ma50.iloc[-2] < ma200.iloc[-2] and ma50.iloc[-1] > ma200.iloc[-1]:
-                            send_alert(token, chat_id, f"{ticker} 골든크로스 ✨", "50일선이 200일선을 상향 돌파했습니다.")
+                            send_alert(token, chat_id, f"{ticker} 골든크로스 ✨", "50일선 돌파 (상승반전 가능성)")
                         elif ma50.iloc[-2] > ma200.iloc[-2] and ma50.iloc[-1] < ma200.iloc[-1]:
-                            send_alert(token, chat_id, f"{ticker} 데드크로스 ☠️", "50일선이 200일선을 하향 돌파했습니다.")
+                            send_alert(token, chat_id, f"{ticker} 데드크로스 ☠️", "50일선 이탈 (하락반전 주의)")
 
                 except: pass
 
@@ -363,7 +365,7 @@ def start_background_worker():
 start_background_worker()
 
 # ---------------------------------------------------------
-# [4] UI (컴팩트 디자인)
+# [4] UI
 # ---------------------------------------------------------
 st.markdown("""
 <style>
@@ -511,13 +513,12 @@ with tab2:
             cols_order = ["Name", "감시_ON", "뉴스", "SEC", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
             df = df.reindex(columns=cols_order, fill_value=False)
             
-            # [수정] 설정창 명칭 변경
             column_config = {
                 "Name": st.column_config.TextColumn("Company", disabled=True, width="small"),
                 "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), 
                 "뉴스": st.column_config.CheckboxColumn("📰 뉴스", help="일반/소셜"),
                 "SEC": st.column_config.CheckboxColumn("🏛️ SEC", help="공시"),
-                "가격_3%": st.column_config.CheckboxColumn("📉 등락", help="3% 이상 급등/급락 시 알림"), # 👈 여기 수정됨
+                "가격_3%": st.column_config.CheckboxColumn("📉 등락", help="3% 이상 급등/급락 시 알림"),
                 "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
                 "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), 
                 "RSI": st.column_config.CheckboxColumn("📊 RSI"),
