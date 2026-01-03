@@ -13,42 +13,87 @@ from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
 
 # --- 프로젝트 설정 ---
+# 로컬 파일은 이제 '백업용'으로만 쓰입니다.
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
 
 # ---------------------------------------------------------
-# [1] 설정 로드 함수 (Secrets 우선 확인 + 파일 백업)
+# [1] 설정 로드/저장 (JSONBin 연동 - 핵심 수정됨)
 # ---------------------------------------------------------
+def get_jsonbin_headers():
+    # Secrets에서 키를 가져옴 (로컬 실행 시 에러 방지)
+    try:
+        if "jsonbin" in st.secrets:
+            return {
+                'Content-Type': 'application/json',
+                'X-Master-Key': st.secrets["jsonbin"]["master_key"]
+            }
+    except: pass
+    return None
+
+def get_jsonbin_url():
+    try:
+        if "jsonbin" in st.secrets:
+            bin_id = st.secrets["jsonbin"]["bin_id"]
+            return f"https://api.jsonbin.io/v3/b/{bin_id}"
+    except: pass
+    return None
+
 def load_config():
-    # 1. 기본 설정 템플릿
+    # 1. 기본값 (최후의 보루)
     config = {
         "system_active": True, 
         "telegram": {"bot_token": "", "chat_id": ""}, 
-        "tickers": {} 
+        "tickers": {
+            "TSLA": {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False},
+            "NVDA": {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
+        } 
     }
 
-    # 2. Streamlit Secrets(금고) 확인
-    if "telegram" in st.secrets:
-        config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
-        config['telegram']['chat_id'] = st.secrets["telegram"]["chat_id"]
-
-    # 3. 로컬 파일 확인 (있으면 덮어쓰기)
-    if os.path.exists(CONFIG_FILE):
+    # 2. [핵심] JSONBin(클라우드 저장소)에서 불러오기
+    url = get_jsonbin_url()
+    headers = get_jsonbin_headers()
+    
+    if url and headers:
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                saved_config = json.load(f)
-                if "tickers" in saved_config: 
-                    config['tickers'] = saved_config['tickers']
-                # 파일에 저장된 키가 있다면 (로컬 테스트용)
-                if saved_config['telegram']['bot_token']:
-                    config['telegram'] = saved_config['telegram']
-        except: pass
+            # 'latest'를 붙여서 최신 데이터 가져옴
+            resp = requests.get(f"{url}/latest", headers=headers, timeout=5)
+            if resp.status_code == 200:
+                cloud_data = resp.json()['record']
+                # 데이터가 비어있지 않다면 적용
+                if "tickers" in cloud_data and cloud_data['tickers']:
+                    config = cloud_data
+                    # print("✅ 클라우드 설정 로드 성공")
+        except Exception as e:
+            print(f"⚠️ 클라우드 로드 실패: {e}")
+
+    # 3. 텔레그램 키는 Secrets가 최우선
+    try:
+        if "telegram" in st.secrets:
+            config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
+            config['telegram']['chat_id'] = st.secrets["telegram"]["chat_id"]
+    except: pass
     
     return config
 
 def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
+    # 1. JSONBin(클라우드)에 저장
+    url = get_jsonbin_url()
+    headers = get_jsonbin_headers()
+    
+    if url and headers:
+        try:
+            # 비동기적으로 저장하면 좋지만, 간단하게 동기 처리 (데이터가 작으므로)
+            requests.put(url, headers=headers, json=config, timeout=5)
+            # print("✅ 클라우드 저장 성공")
+        except Exception as e:
+            print(f"⚠️ 클라우드 저장 실패: {e}")
+
+    # 2. 로컬 파일에도 백업 (로컬 실행용)
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    except: pass
 
 # ---------------------------------------------------------
 # [2] 백그라운드 봇
@@ -68,79 +113,10 @@ def start_background_worker():
             bot = telebot.TeleBot(BOT_TOKEN)
             news_cache = {}
 
-            def get_google_news_rss(ticker):
-                headers = {"User-Agent": "Mozilla/5.0"}
-                url = f"https://news.google.com/rss/search?q={ticker}+stock+when:1d&hl=ko&gl=KR&ceid=KR:ko"
-                try:
-                    response = requests.get(url, headers=headers, timeout=5)
-                    root = ET.fromstring(response.content)
-                    items = []
-                    for item in root.findall('.//item')[:3]: 
-                        try: items.append({'title': item.find('title').text.split(' - ')[0], 'link': item.find('link').text})
-                        except: continue
-                    return items
-                except: return []
-
-            def send_msg(token, chat_id, msg):
-                try: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": msg})
-                except: pass
-
-            def monitor_loop():
-                while True:
-                    try:
-                        cfg = load_config()
-                        if cfg.get('system_active', True) and cfg['tickers']:
-                            token = cfg['telegram']['bot_token']
-                            chat_id = cfg['telegram']['chat_id']
-                            
-                            with ThreadPoolExecutor(max_workers=5) as exe:
-                                for t, s in cfg['tickers'].items():
-                                    if not s.get('감시_ON', True): continue
-                                    
-                                    # 뉴스
-                                    if s.get('뉴스'):
-                                        if t not in news_cache: news_cache[t] = set()
-                                        news = get_google_news_rss(t)
-                                        for item in news:
-                                            if item['link'] not in news_cache[t]:
-                                                if len(news_cache[t]) > 0:
-                                                    send_msg(token, chat_id, f"🚨 [속보] {t}\n📰 {item['title']}\n{item['link']}")
-                                                news_cache[t].add(item['link'])
-                                    
-                                    # 가격 및 기술적 분석
-                                    try:
-                                        stock = yf.Ticker(t)
-                                        info = stock.fast_info
-                                        curr = info.last_price
-                                        
-                                        if s.get('가격_3%'):
-                                            pct = ((curr - info.previous_close)/info.previous_close)*100
-                                            if abs(pct) >= 3.0:
-                                                emoji = "🚀" if pct>0 else "📉"
-                                                send_msg(token, chat_id, f"[{t}] {emoji} {pct:.2f}%\n${curr:.2f}")
-
-                                        if any(s.get(k) for k in ['RSI', 'MA_크로스', '볼린저', 'MACD']):
-                                            hist = stock.history(period="1y")
-                                            if not hist.empty:
-                                                close = hist['Close']
-                                                # RSI 예시
-                                                if s.get('RSI'):
-                                                    delta = close.diff()
-                                                    gain = (delta.where(delta>0, 0)).rolling(14).mean()
-                                                    loss = (-delta.where(delta<0, 0)).rolling(14).mean()
-                                                    rs = gain/loss
-                                                    rsi = 100 - (100/(1+rs)).iloc[-1]
-                                                    if rsi >= 70: send_msg(token, chat_id, f"[{t}] 🔥 RSI 과매수 ({rsi:.1f})")
-                                                    elif rsi <= 30: send_msg(token, chat_id, f"[{t}] 💧 RSI 과매도 ({rsi:.1f})")
-                                    except: pass
-                    except: pass
-                    time.sleep(60)
-
+            # (worker.py의 로직이 돌아가도록 헬스체크만 유지)
             @bot.message_handler(commands=['start'])
             def s(m): bot.reply_to(m, "🤖 DeBrief Cloud Active")
             
-            t_mon = threading.Thread(target=monitor_loop, daemon=True)
-            t_mon.start()
             try: bot.infinity_polling()
             except: pass
             
@@ -197,16 +173,22 @@ def get_stock_data(tickers):
 
 st.set_page_config(page_title="DeBrief", layout="wide", page_icon="📡")
 
-# 설정 로드
 config = load_config()
 
 # [사이드바]
 with st.sidebar:
     st.header("🎛️ Control Panel")
-    if "telegram" in st.secrets:
-        st.success("🔒 Secrets Key 사용 중")
+    
+    # 저장소 연결 상태 확인
+    is_cloud_connected = False
+    try:
+        if "jsonbin" in st.secrets: is_cloud_connected = True
+    except: pass
+
+    if is_cloud_connected:
+        st.success("☁️ 클라우드 저장소 연결됨")
     else:
-        st.warning("⚠️ Secrets 미설정 (파일 모드)")
+        st.warning("📂 로컬 저장 모드 (재부팅 시 초기화)")
         
     system_on = st.toggle("System Power", value=config.get('system_active', True))
     if system_on != config.get('system_active', True):
@@ -229,7 +211,6 @@ with st.sidebar:
 
 # [메인]
 st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud</h3>", unsafe_allow_html=True)
-# [복구됨] 탭 3개 (Dashboard, Management, Logs)
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 # [Tab 1] 시세
@@ -258,7 +239,7 @@ with tab1:
     elif not config['system_active']: st.warning("Paused")
     else: st.info("No tickers found.")
 
-# [Tab 2] 관리 (버튼 복구됨)
+# [Tab 2] 관리
 with tab2:
     st.markdown("##### ➕ Add Tickers")
     c1, c2 = st.columns([4, 1])
@@ -268,15 +249,14 @@ with tab2:
             if input_tickers:
                 for t in [x.strip().upper() for x in input_tickers.split(',') if x.strip()]:
                     if t not in config['tickers']:
-                        config['tickers'][t] = {"감시_ON": True, "뉴스": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
+                        config['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
                 save_config(config)
                 st.rerun()
     
     st.markdown("---")
-    # [복구됨] 전체 제어 버튼
     st.markdown("##### ⚡ Global Controls")
     c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
-    ALL_KEYS = ["감시_ON", "뉴스", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
+    ALL_KEYS = ["감시_ON", "뉴스", "SEC", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
     
     with c_all_1:
         if st.button("✅ ALL ON", use_container_width=True):
@@ -296,19 +276,24 @@ with tab2:
         data_list = []
         for t, settings in config['tickers'].items():
             row = settings.copy()
+            if 'SEC' not in row: row['SEC'] = True 
             row['Name'] = st.session_state.get('company_names', {}).get(t, t)
             data_list.append(row)
         df = pd.DataFrame(data_list, index=config['tickers'].keys())
-        cols_order = ["Name", "감시_ON", "뉴스", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
+        cols_order = ["Name", "감시_ON", "뉴스", "SEC", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
         df = df.reindex(columns=cols_order, fill_value=False)
         
-        # [복구됨] 컬럼 헤더 텍스트 표시
         column_config = {
             "Name": st.column_config.TextColumn("Company", disabled=True, width="small"),
-            "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), "뉴스": st.column_config.CheckboxColumn("📰 뉴스"),
-            "가격_3%": st.column_config.CheckboxColumn("📈 급등"), "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
-            "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), "RSI": st.column_config.CheckboxColumn("📊 RSI"),
-            "MA_크로스": st.column_config.CheckboxColumn("❌ MA"), "볼린저": st.column_config.CheckboxColumn("🍩 볼린저"),
+            "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), 
+            "뉴스": st.column_config.CheckboxColumn("📰 뉴스", help="일반 뉴스/소셜 알림"),
+            "SEC": st.column_config.CheckboxColumn("🏛️ SEC", help="8-K, 10-Q 등 공시 알림"),
+            "가격_3%": st.column_config.CheckboxColumn("📈 급등"), 
+            "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
+            "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), 
+            "RSI": st.column_config.CheckboxColumn("📊 RSI"),
+            "MA_크로스": st.column_config.CheckboxColumn("⚡ 골든/데드", help="50일/200일 이평선 교차"),
+            "볼린저": st.column_config.CheckboxColumn("🍩 볼린저"),
             "MACD": st.column_config.CheckboxColumn("🌊 MACD")
         }
         edited_df = st.data_editor(df, column_config=column_config, use_container_width=True, key="ticker_editor")
@@ -331,7 +316,7 @@ with tab2:
                     save_config(config)
                     st.rerun()
 
-# [복구됨] Tab 3 로그창
+# [Tab 3] 로그창
 with tab3:
     col_l1, col_l2 = st.columns([8, 1])
     with col_l1: st.markdown("##### System Logs")
