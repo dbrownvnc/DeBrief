@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import os
+import pandas as pd  # 👈 여기가 없어서 에러가 났을 수 있습니다.
 import requests
 import yfinance as yf
 import time
@@ -17,20 +18,18 @@ LOG_FILE = 'debrief.log'
 news_cache = {}
 
 # ---------------------------------------------------------
-# [0] 로그 기록 함수 (에러 추적용)
+# [0] 로그 기록 (에러 추적용)
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 터미널 출력
     print(f"[{timestamp}] {msg}")
-    # 파일 저장
     try:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(f"[{timestamp}] {msg}\n")
     except: pass
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장
+# [1] 설정 로드/저장 (JSONBin + 로컬)
 # ---------------------------------------------------------
 def get_jsonbin_headers():
     try:
@@ -60,7 +59,6 @@ def load_config():
             "NVDA": {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
         } 
     }
-
     # 2. JSONBin 로드
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
@@ -71,8 +69,7 @@ def load_config():
                 cloud_data = resp.json()['record']
                 if "tickers" in cloud_data and cloud_data['tickers']:
                     config = cloud_data
-        except Exception as e:
-            write_log(f"Cloud Load Error: {e}")
+        except: pass
 
     # 3. Secrets 우선 적용
     try:
@@ -80,7 +77,6 @@ def load_config():
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
             config['telegram']['chat_id'] = st.secrets["telegram"]["chat_id"]
     except: pass
-    
     return config
 
 def save_config(config):
@@ -89,9 +85,8 @@ def save_config(config):
     headers = get_jsonbin_headers()
     if url and headers:
         try: requests.put(url, headers=headers, json=config, timeout=5)
-        except Exception as e: write_log(f"Cloud Save Error: {e}")
-
-    # 로컬 저장
+        except: pass
+    # 로컬 백업
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
@@ -125,12 +120,10 @@ def get_integrated_news(ticker, strict_mode=False):
                     link = item.find('link').text
                     if link in seen_links: continue
                     seen_links.add(link)
-
                     prefix = "🇰🇷"
                     if "SEC" in url or "8-K" in title or "10-Q" in title: prefix = "🏛️[SEC]"
                     elif "twitter" in url or "reddit" in url: prefix = "🐦[Social]"
                     elif "en-US" in url: prefix = "🇺🇸[Global]"
-                    
                     collected_items.append({'title': f"{prefix} {title}", 'link': link})
                 except: continue
         except: pass
@@ -141,38 +134,34 @@ def get_integrated_news(ticker, strict_mode=False):
     return collected_items
 
 # ---------------------------------------------------------
-# [3] 백그라운드 봇 (에러 잡는 버전)
+# [3] 백그라운드 봇 (명령어 복구 & 에러 방지)
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
     def run_bot_system():
-        time.sleep(1) # 부팅 대기
-        write_log("🤖 봇 시스템 시작 시도...")
-        
+        time.sleep(1)
+        write_log("🤖 봇 시스템 시작...")
         cfg = load_config()
         token = cfg['telegram']['bot_token']
         chat_id = cfg['telegram']['chat_id']
         
-        if not token:
-            write_log("⚠️ 봇 토큰이 없습니다. 설정을 확인하세요.")
-            return
+        if not token: return
         
         try:
             bot = telebot.TeleBot(token)
             
-            # [시작 알림] - 이게 와야 봇이 살아있는 것임
+            # [생존 신고]
             try:
-                bot.send_message(chat_id, "🤖 시스템 재부팅 완료 (V21)\n명령어 대기 중...")
-                write_log("✅ 텔레그램 연결 성공")
+                bot.send_message(chat_id, "🤖 시스템 정상 가동 (명령어 복구됨)\n/help를 눌러보세요.")
             except Exception as e:
-                write_log(f"❌ 텔레그램 메시지 발송 실패: {e}")
+                write_log(f"메시지 전송 실패: {e}")
 
             # ---------------------------
-            # [A] 명령어 핸들러 등록
+            # [A] 명령어 핸들러 (반드시 여기에 정의)
             # ---------------------------
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief V21*\n정상 가동 중입니다.", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V22*\n명령어가 정상 작동 중입니다.", parse_mode='Markdown')
 
             @bot.message_handler(commands=['sec', '공시'])
             def sec_cmd(m):
@@ -190,7 +179,7 @@ def start_background_worker():
                         items.append(f"📅 {pubDate}\n📄 [{title}]({link})")
                     if not items: bot.reply_to(m, f"❌ {t} 공시 없음")
                     else: bot.reply_to(m, "\n\n".join(items), disable_web_page_preview=True)
-                except Exception as e: bot.reply_to(m, f"오류: {e}")
+                except: bot.reply_to(m, "오류 발생")
 
             @bot.message_handler(commands=['news'])
             def news_cmd(m):
@@ -203,7 +192,27 @@ def start_background_worker():
                         txt = f"📰 *{t} Radar*\n"
                         for i, n in enumerate(data): txt += f"\n{i+1}. {n['title']}\n🔗 {n['link']}\n"
                         bot.reply_to(m, txt, parse_mode='Markdown', disable_web_page_preview=True)
-                except Exception as e: bot.reply_to(m, f"오류: {e}")
+                except: pass
+
+            @bot.message_handler(commands=['info'])
+            def info_cmd(message):
+                try:
+                    parts = message.text.split()
+                    if len(parts) < 2: return bot.reply_to(message, "사용법: `/info 티커`")
+                    t = parts[1].upper()
+                    msg = bot.reply_to(message, f"🏢 *{t}* 분석 중...", parse_mode='Markdown')
+                    stock = yf.Ticker(t)
+                    try: i = stock.info
+                    except: return bot.edit_message_text("⚠️ 정보 접근 불가", message.chat.id, msg.message_id)
+                    
+                    def val(k, u="", m=1): 
+                        v = i.get(k)
+                        return f"{v*m:.2f}{u}" if v else "N/A"
+                    res = (f"🏢 *{i.get('shortName', t)}*\n"
+                           f"📊 PER: `{val('trailingPE')}` | PBR: `{val('priceToBook')}`\n"
+                           f"💰 배당: `{val('dividendYield', '%', 100)}` | 목표: `${val('targetMeanPrice')}`")
+                    bot.edit_message_text(res, message.chat.id, msg.message_id, parse_mode='Markdown')
+                except: pass
 
             @bot.message_handler(commands=['p'])
             def price_cmd(m):
@@ -211,7 +220,7 @@ def start_background_worker():
                     t = m.text.split()[1].upper()
                     p = yf.Ticker(t).fast_info.last_price
                     bot.reply_to(m, f"💰 {t}: ${p:.2f}")
-                except: bot.reply_to(m, "조회 실패")
+                except: pass
             
             @bot.message_handler(commands=['market'])
             def market_cmd(m):
@@ -229,38 +238,67 @@ def start_background_worker():
                 c = load_config()
                 bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
 
-            # 메뉴 버튼 설정
+            @bot.message_handler(commands=['add'])
+            def add_cmd(m):
+                try:
+                    t = m.text.split()[1].upper()
+                    c = load_config()
+                    if t not in c['tickers']:
+                        c['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
+                        save_config(c)
+                        bot.reply_to(m, f"✅ {t} 추가됨")
+                    else: bot.reply_to(m, "이미 있음")
+                except: pass
+
+            @bot.message_handler(commands=['del'])
+            def del_cmd(m):
+                try:
+                    t = m.text.split()[1].upper()
+                    c = load_config()
+                    if t in c['tickers']:
+                        del c['tickers'][t]
+                        save_config(c)
+                        bot.reply_to(m, f"🗑️ {t} 삭제됨")
+                except: pass
+
+            @bot.message_handler(commands=['on', 'off'])
+            def toggle_cmd(m):
+                is_on = '/on' in m.text
+                c = load_config()
+                c['system_active'] = is_on
+                save_config(c)
+                bot.reply_to(m, "🟢 가동" if is_on else "⛔ 정지")
+
+            # [메뉴 등록]
             try:
                 bot.set_my_commands([
                     BotCommand("sec", "🏛️ 공시 조회"), BotCommand("news", "📰 뉴스 검색"),
                     BotCommand("p", "💰 현재가"), BotCommand("market", "🌍 시장 현황"),
-                    BotCommand("list", "📋 감시 목록"), BotCommand("help", "❓ 도움말")
+                    BotCommand("list", "📋 목록"), BotCommand("on", "🟢 켜기"),
+                    BotCommand("off", "⛔ 끄기"), BotCommand("help", "❓ 도움말")
                 ])
-            except Exception as e: write_log(f"메뉴 설정 실패: {e}")
+            except: pass
 
             # ---------------------------
-            # [B] 감시 루프 (에러 로깅 추가)
+            # [B] 감시 루프
             # ---------------------------
             def monitor_loop():
-                write_log("👀 감시 루프 시작됨")
+                write_log("👀 감시 루프 시작")
                 while True:
                     try:
                         cfg = load_config()
                         if cfg.get('system_active', True) and cfg['tickers']:
                             cur_token = cfg['telegram']['bot_token']
                             cur_chat = cfg['telegram']['chat_id']
-                            
                             with ThreadPoolExecutor(max_workers=5) as exe:
                                 for t, s in cfg['tickers'].items():
                                     exe.submit(analyze_ticker, t, s, cur_token, cur_chat)
-                    except Exception as e:
-                        write_log(f"Monitor Loop Error: {e}")
+                    except Exception as e: write_log(f"Loop Err: {e}")
                     time.sleep(60)
 
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
-                    # 뉴스 & SEC
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, strict_mode=True)
@@ -268,15 +306,12 @@ def start_background_worker():
                             if item['link'] in news_cache[ticker]: continue
                             is_sec = "🏛️" in item['title']
                             should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
-                            
                             if should_send:
                                 if len(news_cache[ticker]) > 0:
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                                                 data={"chat_id": chat_id, "text": f"🚨 [속보] {ticker}\n{item['title']}\n{item['link']}"})
-                                    write_log(f"알림 발송: {ticker}")
                                 news_cache[ticker].add(item['link'])
                     
-                    # 가격 (간단 체크)
                     stock = yf.Ticker(ticker)
                     info = stock.fast_info
                     curr = info.last_price
@@ -286,29 +321,24 @@ def start_background_worker():
                         if abs(pct) >= 3.0:
                             requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                                         data={"chat_id": chat_id, "text": f"[{ticker}] 🚀 {pct:.2f}%\n${curr:.2f}"})
-                            
-                except Exception as e:
-                    # write_log(f"{ticker} 분석 오류: {e}") # 너무 많이 찍히면 주석 처리
-                    pass
+                except: pass
 
-            # 스레드 시작
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
             t_mon.start()
             
-            write_log("✅ 봇 폴링 시작 (infinity_polling)")
+            write_log("✅ 폴링 시작")
             bot.infinity_polling(timeout=10, long_polling_timeout=5)
             
         except Exception as e:
-            write_log(f"🔥 Critical Bot Error: {e}")
+            write_log(f"🔥 Bot Error: {e}")
 
-    # 백그라운드 스레드 실행
     t_bot = threading.Thread(target=run_bot_system, daemon=True)
     t_bot.start()
 
 start_background_worker()
 
 # ---------------------------------------------------------
-# [4] UI (컴팩트 디자인)
+# [4] UI (컴팩트 + 에러 방지)
 # ---------------------------------------------------------
 st.markdown("""
 <style>
@@ -444,37 +474,44 @@ with tab2:
 
     st.markdown("##### Settings")
     if config['tickers']:
-        data_list = []
-        for t, settings in config['tickers'].items():
-            row = settings.copy()
-            if 'SEC' not in row: row['SEC'] = True 
-            row['Name'] = st.session_state.get('company_names', {}).get(t, t)
-            data_list.append(row)
-        df = pd.DataFrame(data_list, index=config['tickers'].keys())
-        cols_order = ["Name", "감시_ON", "뉴스", "SEC", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
-        df = df.reindex(columns=cols_order, fill_value=False)
-        
-        column_config = {
-            "Name": st.column_config.TextColumn("Company", disabled=True, width="small"),
-            "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), 
-            "뉴스": st.column_config.CheckboxColumn("📰 뉴스", help="일반/소셜"),
-            "SEC": st.column_config.CheckboxColumn("🏛️ SEC", help="공시"),
-            "가격_3%": st.column_config.CheckboxColumn("📈 급등"), 
-            "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
-            "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), 
-            "RSI": st.column_config.CheckboxColumn("📊 RSI"),
-            "MA_크로스": st.column_config.CheckboxColumn("⚡ 골든/데드"),
-            "볼린저": st.column_config.CheckboxColumn("🍩 볼린저"),
-            "MACD": st.column_config.CheckboxColumn("🌊 MACD")
-        }
-        edited_df = st.data_editor(df, column_config=column_config, use_container_width=True, key="ticker_editor")
-        if not df.equals(edited_df):
-            temp_dict = edited_df.to_dict(orient='index')
-            for t in temp_dict:
-                if 'Name' in temp_dict[t]: del temp_dict[t]['Name']
-            config['tickers'] = temp_dict
-            save_config(config)
-            st.toast("Saved!", icon="💾")
+        # [수정] NameError 방지를 위한 try-except 추가
+        try:
+            data_list = []
+            for t, settings in config['tickers'].items():
+                row = settings.copy()
+                if 'SEC' not in row: row['SEC'] = True 
+                row['Name'] = st.session_state.get('company_names', {}).get(t, t)
+                data_list.append(row)
+            
+            # pd (pandas) 사용 부분
+            df = pd.DataFrame(data_list, index=config['tickers'].keys())
+            
+            cols_order = ["Name", "감시_ON", "뉴스", "SEC", "가격_3%", "거래량_2배", "52주_신고가", "RSI", "MA_크로스", "볼린저", "MACD"]
+            df = df.reindex(columns=cols_order, fill_value=False)
+            
+            column_config = {
+                "Name": st.column_config.TextColumn("Company", disabled=True, width="small"),
+                "감시_ON": st.column_config.CheckboxColumn("✅ 감시"), 
+                "뉴스": st.column_config.CheckboxColumn("📰 뉴스", help="일반/소셜"),
+                "SEC": st.column_config.CheckboxColumn("🏛️ SEC", help="공시"),
+                "가격_3%": st.column_config.CheckboxColumn("📈 급등"), 
+                "거래량_2배": st.column_config.CheckboxColumn("📢 거래량"),
+                "52주_신고가": st.column_config.CheckboxColumn("🏆 신고가"), 
+                "RSI": st.column_config.CheckboxColumn("📊 RSI"),
+                "MA_크로스": st.column_config.CheckboxColumn("⚡ 골든/데드", help="50일/200일 이평선 교차"),
+                "볼린저": st.column_config.CheckboxColumn("🍩 볼린저"),
+                "MACD": st.column_config.CheckboxColumn("🌊 MACD")
+            }
+            edited_df = st.data_editor(df, column_config=column_config, use_container_width=True, key="ticker_editor")
+            if not df.equals(edited_df):
+                temp_dict = edited_df.to_dict(orient='index')
+                for t in temp_dict:
+                    if 'Name' in temp_dict[t]: del temp_dict[t]['Name']
+                config['tickers'] = temp_dict
+                save_config(config)
+                st.toast("Saved!", icon="💾")
+        except Exception as e:
+            st.error(f"테이블 렌더링 오류: {e}")
         
         st.markdown("---")
         col_del1, col_del2 = st.columns([4, 1])
