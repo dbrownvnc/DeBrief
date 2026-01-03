@@ -11,14 +11,13 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
-# 번역 라이브러리
 from deep_translator import GoogleTranslator
 
 # --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
 
-# 알림 캐시 통합 관리 (중복 방지용)
+# 캐시 초기화
 if 'news_cache' not in st.session_state: st.session_state['news_cache'] = {}
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
@@ -27,20 +26,14 @@ news_cache = st.session_state['news_cache']
 price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
 
-# ---------------------------------------------------------
-# [0] 로그 기록
-# ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
     try:
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(f"[{timestamp}] {msg}\n")
     except: pass
 
-# ---------------------------------------------------------
-# [1] 설정 로드/저장 (JSONBin + 로컬 백업)
-# ---------------------------------------------------------
+# --- 설정 로드/저장 ---
 def get_jsonbin_headers():
     try:
         if "jsonbin" in st.secrets:
@@ -93,21 +86,15 @@ def save_config(config):
             json.dump(config, f, indent=4, ensure_ascii=False)
     except: pass
 
-# ---------------------------------------------------------
-# [2] 뉴스 검색 엔진 (번역 기능 포함)
-# ---------------------------------------------------------
+# --- 뉴스 검색 엔진 (번역 포함) ---
 def get_integrated_news(ticker, strict_mode=False):
     headers = {"User-Agent": "Mozilla/5.0"}
     sec_query = f"{ticker} SEC Filing OR 8-K OR 10-Q"
     search_urls = [
         f"https://news.google.com/rss/search?q={sec_query} when:1d&hl=en-US&gl=US&ceid=US:en",
         f"https://news.google.com/rss/search?q={ticker}+주가+when:1d&hl=ko&gl=KR&ceid=KR:ko",
-        f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en",
-        f"https://news.google.com/rss/search?q={ticker}+stock+(twitter+OR+reddit)+when:1d&hl=en-US&gl=US&ceid=US:en"
+        f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en"
     ]
-    if not strict_mode:
-        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+stock&hl=ko&gl=KR&ceid=KR:ko")
-
     collected_items = []
     seen_links = set()
     translator = GoogleTranslator(source='auto', target='ko')
@@ -117,82 +104,76 @@ def get_integrated_news(ticker, strict_mode=False):
             response = requests.get(url, headers=headers, timeout=3)
             root = ET.fromstring(response.content)
             for item in root.findall('.//item')[:2]: 
-                try:
-                    title = item.find('title').text.split(' - ')[0]
-                    link = item.find('link').text
-                    if link in seen_links: continue
-                    seen_links.add(link)
-                    
-                    prefix = "🇰🇷"
-                    is_foreign = False
-                    
-                    if "SEC" in url or "8-K" in title or "10-Q" in title: 
-                        prefix = "🏛️[SEC]"; is_foreign = True
-                    elif "twitter" in url or "reddit" in url: 
-                        prefix = "🐦[Social]"; is_foreign = True
-                    elif "en-US" in url: 
-                        prefix = "🇺🇸[Global]"; is_foreign = True
-                    
-                    if is_foreign:
-                        try:
-                            translated_title = translator.translate(title[:100])
-                            title = f"{translated_title} (원문: {title})"
-                        except: pass
-
-                    collected_items.append({'title': f"{prefix} {title}", 'link': link})
-                except: continue
+                title = item.find('title').text.split(' - ')[0]
+                link = item.find('link').text
+                if link in seen_links: continue
+                seen_links.add(link)
+                
+                is_foreign = ("en-US" in url or "SEC" in url)
+                if is_foreign:
+                    try: title = f"{translator.translate(title[:100])} (원문: {title})"
+                    except: pass
+                
+                prefix = "🏛️[SEC]" if "SEC" in url else "🇺🇸" if is_foreign else "🇰🇷"
+                collected_items.append({'title': f"{prefix} {title}", 'link': link})
         except: pass
 
-    for url in search_urls:
-        fetch(url)
-        if len(collected_items) >= 8: break
+    for url in search_urls: fetch(url)
     return collected_items
 
-# ---------------------------------------------------------
-# [3] 백그라운드 봇 (감시 및 명령어 통합)
-# ---------------------------------------------------------
+# --- 백그라운드 봇 ---
 @st.cache_resource
 def start_background_worker():
     def run_bot_system():
         time.sleep(1)
-        write_log("🤖 봇 시스템 시작...")
         cfg = load_config()
         token = cfg['telegram']['bot_token']
         chat_id = cfg['telegram']['chat_id']
-        
         if not token: return
         
         try:
             bot = telebot.TeleBot(token)
-            try: bot.send_message(chat_id, "🤖 DeBrief 시스템 가동 (V26)\n번역 및 알림 최적화 적용됨")
-            except: pass
+            
+            # [복구] 실적 발표일 조회 명령어
+            @bot.message_handler(commands=['earning', '실적'])
+            def earning_cmd(m):
+                try:
+                    parts = m.text.split()
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: `/earning 티커` (예: /earning TSLA)")
+                    t = parts[1].upper()
+                    bot.send_chat_action(m.chat.id, 'typing')
+                    
+                    stock = yf.Ticker(t)
+                    calendar = stock.calendar
+                    
+                    if calendar is None or calendar.empty:
+                        return bot.reply_to(m, f"❌ {t}: 예정된 실적 발표 데이터가 없습니다.")
+                    
+                    # 데이터 추출
+                    e_date = calendar.iloc[0, 0].strftime('%Y-%m-%d')
+                    eps_est = calendar.iloc[0, 1] if len(calendar) > 1 else "N/A"
+                    rev_est = calendar.iloc[0, 2] if len(calendar) > 2 else "N/A"
+                    
+                    # 장 전/후 정보 (yf 라이브러리 특성상 info에서 보충 가능)
+                    time_info = "발표 시간 미정"
+                    try:
+                        info = stock.info
+                        if 'earningsCallTimestamp' in info:
+                            # 상세 시간 정보가 있을 경우 처리
+                            pass 
+                    except: pass
 
-            # 명령어 핸들러
+                    msg = (f"📅 *{t} 실적 발표 예정*\n\n"
+                           f"🗓️ 발표일: `{e_date}`\n"
+                           f"💰 예상 EPS: `{eps_est}`\n"
+                           f"📈 예상 매출: `{rev_est:,.0f}`\n\n"
+                           f"_※ 날짜는 현지 시간 기준이며 변동될 수 있습니다._")
+                    bot.reply_to(m, msg, parse_mode='Markdown')
+                except Exception as e:
+                    bot.reply_to(m, "❌ 실적 정보를 가져오는 중 오류가 발생했습니다.")
+
             @bot.message_handler(commands=['start', 'help'])
-            def start_cmd(m): bot.reply_to(m, "🤖 *DeBrief V26*\n/sec, /news, /add, /del, /market, /p")
-
-            @bot.message_handler(commands=['add'])
-            def add_cmd(m):
-                try:
-                    t = m.text.split()[1].upper()
-                    c = load_config()
-                    if t not in c['tickers']:
-                        c['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
-                        save_config(c)
-                        bot.reply_to(m, f"✅ {t} 추가됨")
-                    else: bot.reply_to(m, "이미 존재함")
-                except: bot.reply_to(m, "사용법: /add TSLA")
-
-            @bot.message_handler(commands=['del'])
-            def del_cmd(m):
-                try:
-                    t = m.text.split()[1].upper()
-                    c = load_config()
-                    if t in c['tickers']:
-                        del c['tickers'][t]
-                        save_config(c)
-                        bot.reply_to(m, f"🗑️ {t} 삭제됨")
-                except: bot.reply_to(m, "사용법: /del TSLA")
+            def start_cmd(m): bot.reply_to(m, "🤖 *DeBrief V27*\n/earning, /sec, /news, /p, /market")
 
             @bot.message_handler(commands=['sec'])
             def sec_cmd(m):
@@ -234,11 +215,14 @@ def start_background_worker():
                     bot.reply_to(m, txt, parse_mode='Markdown')
                 except: pass
 
+            # [업데이트] 메뉴 설명 추가
             try:
                 bot.set_my_commands([
-                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제"),
-                    BotCommand("sec", "🏛️ 공시"), BotCommand("news", "📰 뉴스"),
-                    BotCommand("p", "💰 현재가"), BotCommand("market", "🌍 시장"),
+                    BotCommand("earning", "📅 실적 발표일 (예상 EPS/매출)"),
+                    BotCommand("sec", "🏛️ 공시 조회 (8-K/10-Q)"),
+                    BotCommand("news", "📰 뉴스/소셜 통합 검색"),
+                    BotCommand("p", "💰 현재가 조회"),
+                    BotCommand("market", "🌍 시장 지수 현황"),
                     BotCommand("help", "❓ 도움말")
                 ])
             except: pass
@@ -262,24 +246,12 @@ def start_background_worker():
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
-                    # 뉴스/공시
-                    if settings.get('뉴스') or settings.get('SEC'):
-                        if ticker not in news_cache: news_cache[ticker] = set()
-                        items = get_integrated_news(ticker, strict_mode=True)
-                        for item in items:
-                            if item['link'] in news_cache[ticker]: continue
-                            is_sec = "🏛️" in item['title']
-                            if (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스')):
-                                if len(news_cache[ticker]) > 0:
-                                    send_alert(token, chat_id, f"{ticker} 소식", f"{item['title']}\n🔗 [Link]({item['link']})")
-                                news_cache[ticker].add(item['link'])
-                    
-                    # 가격 및 RSI
-                    stock = yf.Ticker(ticker); hist = stock.history(period="1y")
+                    stock = yf.Ticker(ticker)
+                    hist = stock.history(period="5d")
                     if hist.empty: return
                     close = hist['Close']; curr = close.iloc[-1]; prev = close.iloc[-2]
                     
-                    # 등락 필터
+                    # 가격 등락 필터
                     if settings.get('가격_3%'):
                         pct = ((curr - prev) / prev) * 100
                         if abs(pct) >= 3.0:
@@ -309,15 +281,12 @@ def start_background_worker():
 
 start_background_worker()
 
-# ---------------------------------------------------------
-# [4] UI (컴팩트 디자인)
-# ---------------------------------------------------------
+# --- UI (기존 컴팩트 디자인) ---
 st.set_page_config(page_title="DeBrief", layout="wide", page_icon="📡")
 st.markdown("""<style>
     .stApp { background-color: #FFFFFF; color: #202124; }
     .stock-card { background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px; padding: 8px 5px; margin-bottom: 6px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
     .stock-symbol { font-size: 1.0em; font-weight: 800; color: #1A73E8; }
-    .stock-name { font-size: 0.65em; color: #5F6368; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .stock-price-box { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; font-weight: 700; }
     .up-theme { background-color: #E6F4EA; color: #137333; } .down-theme { background-color: #FCE8E6; color: #C5221F; }
 </style>""", unsafe_allow_html=True)
@@ -326,8 +295,7 @@ config = load_config()
 
 with st.sidebar:
     st.header("🎛️ Control Panel")
-    if st.toggle("System Power", value=config.get('system_active', True)):
-        st.success("🟢 Active")
+    if st.toggle("System Power", value=config.get('system_active', True)): st.success("🟢 Active")
     else: st.error("⛔ Paused")
     with st.expander("🔑 Keys"):
         bot_t = st.text_input("Bot Token", value=config['telegram'].get('bot_token', ''), type="password")
@@ -353,7 +321,7 @@ with t1:
             except: pass
 
 with t2:
-    input_t = st.text_input("Add Tickers (TSLA, NVDA...)")
+    input_t = st.text_input("Add Tickers")
     if st.button("➕ Add"):
         for t in [x.strip().upper() for x in input_t.split(',') if x.strip()]:
             config['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
