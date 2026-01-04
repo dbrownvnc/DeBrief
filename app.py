@@ -8,6 +8,7 @@ import time
 import threading
 import telebot
 import xml.etree.ElementTree as ET
+import cloudscraper  # [NEW] 403 우회용 라이브러리
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
@@ -139,23 +140,22 @@ def get_integrated_news(ticker, strict_mode=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# [NEW] 경제지표 크롤러 (403 우회 헤더 적용)
+# [NEW] 경제지표 크롤러 (Cloudscraper 적용 - 403 우회)
 def get_economic_events():
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Referer': 'https://www.investing.com/',
-            'Cache-Control': 'no-cache'
-        }
+        # cloudscraper 인스턴스 생성 (브라우저인 척 위장)
+        scraper = cloudscraper.create_scraper()
+        
         url = "https://sslecal2.forexprostools.com/?columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous&features=datepicker,timezone&countries=5&calType=week&timeZone=88&lang=1"
         
-        response = requests.get(url, headers=headers, timeout=10)
+        # scraper로 요청 (requests 대신 사용)
+        response = scraper.get(url)
         
         if response.status_code != 200:
-            write_log(f"🔥 Eco URL 차단됨: {response.status_code}")
+            write_log(f"🔥 Eco URL 차단됨: {response.status_code} (Cloudscraper failed)")
             return []
 
+        # HTML 파싱
         dfs = pd.read_html(response.text)
         if not dfs: return []
         
@@ -167,12 +167,15 @@ def get_economic_events():
         
         for idx, row in df.iterrows():
             val0 = str(row['Time'])
+            # 날짜 행 파싱
             if "년" in val0 and "월" in val0 and "일" in val0:
                 current_date_str = val0
                 continue
             
+            # 중요도 체크 (별 2~3개)
             imp_str = str(row['Imp'])
-            is_important = ('🐂' in imp_str and imp_str.count('🐂') >= 2) or ('High' in imp_str or 'Medium' in imp_str)
+            is_important = ('🐂' in imp_str and imp_str.count('🐂') >= 2) or \
+                           ('High' in imp_str or 'Medium' in imp_str)
             
             if row['Cur'] == 'USD' and is_important:
                 events.append({
@@ -209,15 +212,15 @@ def start_background_worker():
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V37 가동\n시스템이 정상화되었습니다.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V38 가동\n403 우회 패치 및 메뉴 복구가 완료되었습니다.")
             except: pass
 
             # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V37 사용법*\n\n"
+                msg = ("🤖 *DeBrief V38 사용법*\n\n"
                        "📅 *경제/실적*\n"
-                       "`/eco` : 이번 주 경제 일정\n"
+                       "`/eco` : 이번 주 경제 일정 (강력 조회)\n"
                        "`/earning 티커` : 실적 발표일\n"
                        "`/summary 티커` : 재무 요약\n"
                        "`/vix` : 공포 지수\n\n"
@@ -238,7 +241,7 @@ def start_background_worker():
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
                     if not events:
-                        bot.reply_to(m, "❌ 경제지표 데이터를 가져올 수 없습니다.\n(잠시 후 다시 시도해주세요)")
+                        bot.reply_to(m, "❌ 경제지표 데이터를 가져올 수 없습니다.\n(보안 정책으로 차단되었을 수 있습니다)")
                         return
                     
                     msg = "📅 *주요 경제지표 일정*\n────────────────"
@@ -290,11 +293,9 @@ def start_background_worker():
                     if not i:
                         bot.reply_to(m, "정보 없음")
                         return
-                    
                     def s(k): 
                         val = i.get(k)
                         return f"{val:,.2f}" if isinstance(val, (int, float)) else "N/A"
-                        
                     msg = (f"📊 *{t} 요약*\n💰 현재가: ${s('currentPrice')}\n🏢 시총: ${s('marketCap')}\n📈 PER: {s('trailingPE')}\n🎯 목표: ${s('targetMeanPrice')}")
                     bot.reply_to(m, msg, parse_mode='Markdown')
                 except Exception:
@@ -347,7 +348,9 @@ def start_background_worker():
                     t = m.text.split()[1].upper()
                     items = get_integrated_news(t)
                     secs = [i for i in items if "SEC" in i['title']]
-                    if secs: bot.reply_to(m, f"🏛️ *{t} SEC*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in secs]), parse_mode='Markdown')
+                    if secs: 
+                        msg = f"🏛️ *{t} SEC*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in secs])
+                        bot.reply_to(m, msg, parse_mode='Markdown', disable_web_page_preview=True)
                     else: bot.reply_to(m, "공시 없음")
                 except Exception: pass
 
@@ -542,7 +545,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V37)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V38)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
