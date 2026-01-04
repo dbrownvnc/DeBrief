@@ -6,3 +6,4 @@ requests
 deep-translator
 lxml
 html5lib
+cloudscraper
