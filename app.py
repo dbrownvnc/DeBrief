@@ -142,25 +142,36 @@ def get_integrated_news(ticker, strict_mode=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# [NEW] 경제지표 크롤러 (강화판)
+# [NEW] 경제지표 크롤러 (403 우회 강화판)
 def get_economic_events():
     try:
-        # 1. 헤더 추가 (차단 우회 핵심)
+        # [수정] 403 Forbidden 방지를 위한 완벽한 브라우저 위장 헤더
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://www.investing.com/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,ko;q=0.8',
+            'Cache-Control': 'max-age=0',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1'
         }
+        
+        # URL (Investing.com Widget)
         url = "https://sslecal2.forexprostools.com/?columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous&features=datepicker,timezone&countries=5&calType=week&timeZone=88&lang=1"
         
-        # 2. requests로 먼저 가져오기 (pandas 바로 사용 X)
+        # 1. Requests로 HTML 가져오기 (타임아웃 10초)
         response = requests.get(url, headers=headers, timeout=10)
         
+        # 403 에러 발생 시 로그 남기고 빈 리스트 반환
         if response.status_code != 200:
-            write_log(f"Eco URL Access Failed: {response.status_code}")
+            write_log(f"🔥 Eco URL 차단됨: {response.status_code}")
             return []
 
-        # 3. HTML 테이블 파싱
+        # 2. Pandas로 파싱
         dfs = pd.read_html(response.text)
         if not dfs: return []
         
@@ -172,7 +183,7 @@ def get_economic_events():
         
         for idx, row in df.iterrows():
             val0 = str(row['Time'])
-            # 날짜 행 확인
+            # 날짜 행 파싱
             if "년" in val0 and "월" in val0 and "일" in val0:
                 current_date_str = val0
                 continue
@@ -217,13 +228,13 @@ def start_background_worker():
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V34 가동\n경제지표 수집 엔진이 강화되었습니다.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V35 가동\n경제지표 연결이 복구되었습니다 (403 Patch).")
             except: pass
 
             # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V34 사용법*\n\n"
+                msg = ("🤖 *DeBrief V35 사용법*\n\n"
                        "📅 *경제/실적*\n"
                        "`/eco` : 이번 주 경제 일정\n"
                        "`/earning 티커` : 실적 발표일\n"
@@ -246,22 +257,19 @@ def start_background_worker():
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
                     if not events:
-                        bot.reply_to(m, "❌ 경제지표 데이터를 가져올 수 없습니다.\n(잠시 후 다시 시도해주세요)")
+                        bot.reply_to(m, "❌ 데이터 수신 실패 (서버 연결 불가)")
                         return
                     
                     msg = "📅 *주요 경제지표 일정*\n────────────────"
                     count = 0
                     for e in events:
-                        # 이미 발표된 값은 체크 표시
                         status = f"✅{e['actual']}" if e['actual'] and 'nan' not in e['actual'].lower() else f"예상:{e['forecast']}"
-                        
-                        # 중요 키워드만 표시
                         if any(x in e['event'] for x in ['CPI', 'PPI', 'Rate', 'GDP', 'Fed', 'Sales', 'Employment']):
                             msg += f"\n🗓️ {e['date_kor']} {e['time']}\n🔥 *{e['event']}*\n({status})\n"
                             count += 1
                             if count >= 15: break
                     
-                    if count == 0: msg += "\n(이번 주 남은 주요 일정이 없습니다)"
+                    if count == 0: msg += "\n(표시할 주요 일정이 없습니다)"
                     bot.reply_to(m, msg, parse_mode='Markdown')
                 except Exception as e:
                     bot.reply_to(m, f"오류: {e}")
@@ -310,7 +318,6 @@ def start_background_worker():
                     bot.reply_to(m, f"😨 *VIX*: `{v.last_price:.2f}`", parse_mode='Markdown')
                 except: pass
 
-            # 기본 명령어 (add, del, list, news, sec, p, market, on/off)
             @bot.message_handler(commands=['add'])
             def add_cmd(m):
                 try:
@@ -537,7 +544,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V34)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V35)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
