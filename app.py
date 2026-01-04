@@ -164,12 +164,75 @@ def start_background_worker():
         
         try:
             bot = telebot.TeleBot(token)
-            try: bot.send_message(chat_id, "🤖 DeBrief 시스템 가동 (V26)\n번역 및 알림 최적화 적용됨")
+            try: bot.send_message(chat_id, "🤖 DeBrief 시스템 가동 (V27)\n실적 발표일 조회 기능이 복구되었습니다.")
             except: pass
 
-            # 명령어 핸들러
+            # --- [NEW] 실적 발표일 조회 명령어 ---
+            @bot.message_handler(commands=['earning', '실적'])
+            def earning_cmd(m):
+                try:
+                    parts = m.text.split()
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: `/earning 티커` (예: /earning NVDA)")
+                    t = parts[1].upper()
+                    bot.send_chat_action(m.chat.id, 'typing') # 타이핑 중 표시
+                    
+                    stock = yf.Ticker(t)
+                    # earnings_dates를 사용하여 더 정확한 미래 날짜 조회
+                    try:
+                        dates = stock.earnings_dates
+                        if dates is None or dates.empty:
+                            raise Exception("No Data")
+                        
+                        # 미래 날짜 중 가장 가까운 것 찾기 (또는 가장 최근 미래)
+                        future_dates = dates.index[dates.index >= pd.Timestamp.now().normalize()]
+                        if not future_dates.empty:
+                            target_date = future_dates[-1] # 보통 데이터프레임이 내림차순이라 뒤쪽이 가까운 미래일 수 있음 (확인 필요) -> yfinance는 내림차순(최신이 위)이므로 미래 날짜 중 가장 작은 인덱스가 아니라, 현재 시점 이후 가장 가까운 날짜를 찾아야 함.
+                            # yfinance earnings_dates는 index가 datetime이고 내림차순 정렬됨.
+                            # 미래 날짜는 index 0번에 가까움 (가장 먼 미래 ~ 과거 순). 
+                            # 하지만 가끔 과거 데이터만 있는 경우도 있음.
+                            
+                            # 다시 정렬해서 가장 가까운 미래 찾기
+                            dates_sorted = dates.sort_index()
+                            next_earnings = dates_sorted.index[dates_sorted.index >= pd.Timestamp.now().normalize()]
+                            
+                            if not next_earnings.empty:
+                                target_idx = next_earnings[0]
+                                record = dates.loc[target_idx]
+                                
+                                # 데이터 추출
+                                d_str = target_idx.strftime('%Y-%m-%d %H:%M')
+                                eps_est = record.get('EPS Estimate', 'N/A')
+                                rev_est = record.get('Reported EPS', 'N/A') # yfinance 데이터 구조상 Reported EPS 자리에 예상치가 들어가는 경우가 있음. 
+                                # 정확히는 'Estimate' 컬럼이 있는 경우 사용
+                                
+                                if 'EPS Estimate' in record: eps_est = record['EPS Estimate']
+                                
+                                msg = (f"📅 *{t} 차기 실적 발표*\n\n"
+                                       f"🗓️ 일시: `{d_str}`\n"
+                                       f"💰 예상 EPS: `{eps_est}`\n"
+                                       f"📊 컨센서스: `{rev_est}` (참고용)\n\n"
+                                       f"_※ 현지 시간 기준이며 변동될 수 있습니다._")
+                                bot.reply_to(m, msg, parse_mode='Markdown')
+                                return
+                            
+                    except Exception as e:
+                        # 캘린더 방식으로 재시도 (백업)
+                        try:
+                            cal = stock.calendar
+                            if cal and not cal.empty:
+                                d = cal.iloc[0, 0].strftime('%Y-%m-%d')
+                                bot.reply_to(m, f"📅 *{t} 실적 발표 (Calendar)*\n예정일: `{d}`\n(상세 데이터 수신 실패)", parse_mode='Markdown')
+                                return
+                        except: pass
+
+                    bot.reply_to(m, f"❌ {t}: 예정된 실적 발표 정보를 찾을 수 없습니다.")
+
+                except Exception as e:
+                    bot.reply_to(m, f"❌ 오류 발생: {e}")
+
+            # 기존 명령어들
             @bot.message_handler(commands=['start', 'help'])
-            def start_cmd(m): bot.reply_to(m, "🤖 *DeBrief V26*\n/sec, /news, /add, /del, /market, /p")
+            def start_cmd(m): bot.reply_to(m, "🤖 *DeBrief V27*\n/earning, /sec, /news, /add, /del, /market, /p")
 
             @bot.message_handler(commands=['add'])
             def add_cmd(m):
@@ -234,11 +297,16 @@ def start_background_worker():
                     bot.reply_to(m, txt, parse_mode='Markdown')
                 except: pass
 
+            # 메뉴 설명 업그레이드
             try:
                 bot.set_my_commands([
-                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제"),
-                    BotCommand("sec", "🏛️ 공시"), BotCommand("news", "📰 뉴스"),
-                    BotCommand("p", "💰 현재가"), BotCommand("market", "🌍 시장"),
+                    BotCommand("earning", "📅 실적 발표일 (EPS/매출 예상)"),
+                    BotCommand("add", "➕ 종목 추가"), 
+                    BotCommand("del", "🗑️ 종목 삭제"),
+                    BotCommand("sec", "🏛️ 공시 조회"), 
+                    BotCommand("news", "📰 뉴스 검색"),
+                    BotCommand("p", "💰 현재가"), 
+                    BotCommand("market", "🌍 시장 지수"),
                     BotCommand("help", "❓ 도움말")
                 ])
             except: pass
