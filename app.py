@@ -142,22 +142,17 @@ def get_integrated_news(ticker, strict_mode=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# [NEW] 경제지표 크롤러 (403 우회 강화판)
+# [NEW] 경제지표 크롤러 (403 우회 헤더 적용)
 def get_economic_events():
     try:
-        # [수정] 403 Forbidden 방지를 위한 완벽한 브라우저 위장 헤더
+        # [수정] 403 Forbidden 방지 헤더 강화
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
             'Referer': 'https://www.investing.com/',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9,ko;q=0.8',
-            'Cache-Control': 'max-age=0',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1'
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
         }
         
         # URL (Investing.com Widget)
@@ -166,7 +161,6 @@ def get_economic_events():
         # 1. Requests로 HTML 가져오기 (타임아웃 10초)
         response = requests.get(url, headers=headers, timeout=10)
         
-        # 403 에러 발생 시 로그 남기고 빈 리스트 반환
         if response.status_code != 200:
             write_log(f"🔥 Eco URL 차단됨: {response.status_code}")
             return []
@@ -228,13 +222,13 @@ def start_background_worker():
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V35 가동\n경제지표 연결이 복구되었습니다 (403 Patch).")
+            try: bot.send_message(chat_id, "🤖 DeBrief V36 가동\n메뉴 복구 및 링크 단축 적용 완료.")
             except: pass
 
             # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V35 사용법*\n\n"
+                msg = ("🤖 *DeBrief V36 사용법*\n\n"
                        "📅 *경제/실적*\n"
                        "`/eco` : 이번 주 경제 일정\n"
                        "`/earning 티커` : 실적 발표일\n"
@@ -257,7 +251,7 @@ def start_background_worker():
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
                     if not events:
-                        bot.reply_to(m, "❌ 데이터 수신 실패 (서버 연결 불가)")
+                        bot.reply_to(m, "❌ 경제지표 데이터를 가져올 수 없습니다.\n(잠시 후 다시 시도해주세요)")
                         return
                     
                     msg = "📅 *주요 경제지표 일정*\n────────────────"
@@ -269,7 +263,7 @@ def start_background_worker():
                             count += 1
                             if count >= 15: break
                     
-                    if count == 0: msg += "\n(표시할 주요 일정이 없습니다)"
+                    if count == 0: msg += "\n(이번 주 남은 주요 일정이 없습니다)"
                     bot.reply_to(m, msg, parse_mode='Markdown')
                 except Exception as e:
                     bot.reply_to(m, f"오류: {e}")
@@ -318,14 +312,16 @@ def start_background_worker():
                     bot.reply_to(m, f"😨 *VIX*: `{v.last_price:.2f}`", parse_mode='Markdown')
                 except: pass
 
+            # 기본 명령어 (add, del, list, news, sec, p, market, on/off)
             @bot.message_handler(commands=['add'])
             def add_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
                     c = load_config()
-                    c['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
-                    save_config(c); bot.reply_to(m, f"✅ {t} 추가됨")
-                except: pass
+                    if t not in c['tickers']:
+                        c['tickers'][t] = {"감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True, "거래량_2배": False, "52주_신고가": True, "RSI": False, "MA_크로스":False, "볼린저":False, "MACD":False}
+                        save_config(c); bot.reply_to(m, f"✅ {t} 추가됨")
+                    except: pass
 
             @bot.message_handler(commands=['del'])
             def del_cmd(m):
@@ -345,6 +341,7 @@ def start_background_worker():
                 try:
                     t = m.text.split()[1].upper()
                     items = get_integrated_news(t)
+                    # [수정] 링크 단축 처리 (Markdown)
                     msg = f"📰 *{t} News*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in items])
                     bot.reply_to(m, msg, parse_mode='Markdown', disable_web_page_preview=True)
                 except: pass
@@ -355,7 +352,10 @@ def start_background_worker():
                     t = m.text.split()[1].upper()
                     items = get_integrated_news(t)
                     secs = [i for i in items if "SEC" in i['title']]
-                    if secs: bot.reply_to(m, f"🏛️ *{t} SEC*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in secs]), parse_mode='Markdown')
+                    if secs: 
+                        # [수정] 링크 단축 처리 (Markdown)
+                        msg = f"🏛️ *{t} SEC*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in secs])
+                        bot.reply_to(m, msg, parse_mode='Markdown', disable_web_page_preview=True)
                     else: bot.reply_to(m, "공시 없음")
                 except: pass
 
@@ -383,14 +383,21 @@ def start_background_worker():
                 save_config(c)
                 bot.reply_to(m, f"시스템 {'가동' if c['system_active'] else '정지'}")
 
+            # [수정] 누락된 메뉴 항목 추가
             try:
                 bot.set_my_commands([
                     BotCommand("eco", "📅 경제지표"),
                     BotCommand("earning", "💰 실적 발표"),
-                    BotCommand("news", "📰 뉴스"),
+                    BotCommand("news", "📰 뉴스 검색"),
                     BotCommand("p", "💰 현재가"),
                     BotCommand("summary", "📊 요약"),
-                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제"),
+                    BotCommand("sec", "🏛️ 공시 조회"),
+                    BotCommand("vix", "😨 공포 지수"),
+                    BotCommand("list", "📋 감시 목록"),
+                    BotCommand("add", "➕ 추가"), 
+                    BotCommand("del", "🗑️ 삭제"),
+                    BotCommand("on", "🟢 가동"),
+                    BotCommand("off", "⛔ 정지"),
                     BotCommand("help", "❓ 도움말")
                 ])
             except: pass
@@ -406,7 +413,7 @@ def start_background_worker():
                         # 1. 경제지표 알림
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
-                            # 주간 브리핑 (월요일 08시)
+                            # 주간 브리핑
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
@@ -420,7 +427,7 @@ def start_background_worker():
                                         bot.send_message(chat_id, msg, parse_mode='Markdown')
                                         last_weekly_sent = now.strftime('%Y-%m-%d')
 
-                            # 데일리 브리핑 (매일 08시)
+                            # 데일리 브리핑
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 today = f"{now.year}년 {now.month:02d}월 {now.day:02d}일"
@@ -462,8 +469,9 @@ def start_background_worker():
                         for item in items:
                             if item['link'] in news_cache[ticker]: continue
                             prefix = "🏛️" if "SEC" in item['title'] else "📰"
+                            # [수정] 링크 단축 처리 (Markdown)
                             requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                        data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n{item['title']}\n{item['link']}", "parse_mode": "Markdown"})
+                                        data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n{item['title']}\n🔗 [기사 원문 보기]({item['link']})", "parse_mode": "Markdown"})
                             news_cache[ticker].add(item['link'])
                     
                     # 가격
@@ -544,7 +552,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V35)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V36)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
