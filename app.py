@@ -160,25 +160,24 @@ def start_background_worker():
         
         try:
             bot = telebot.TeleBot(token)
-            try: bot.send_message(chat_id, "🤖 DeBrief V30 가동\n실적 발표 및 재무 요약 기능이 추가되었습니다.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V31 가동\n실적 발표 조회 기능이 강화되었습니다.")
             except: pass
 
             # ==========================================
             # [A] 봇 명령어 핸들러
             # ==========================================
 
-            # 1. 시작 및 도움말
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V30 사용법*\n\n"
+                msg = ("🤖 *DeBrief V31 사용법*\n\n"
                        "📊 *조회 명령어*\n"
                        "`/p 티커` : 현재가 조회\n"
-                       "`/earning 티커` : 실적 발표일 & 예상치\n"
-                       "`/summary 티커` : 재무 정보 요약 (NEW)\n"
+                       "`/earning 티커` : 실적 발표일 & 예상치 (Fix)\n"
+                       "`/summary 티커` : 재무 정보 요약\n"
                        "`/news 티커` : 뉴스 검색 (번역)\n"
                        "`/sec 티커` : 공시 조회\n"
                        "`/market` : 주요 시장 지수\n"
-                       "`/vix` : 공포 지수 조회 (NEW)\n\n"
+                       "`/vix` : 공포 지수 조회\n\n"
                        "⚙️ *관리 명령어*\n"
                        "`/list` : 감시 목록\n"
                        "`/add 티커` : 종목 추가\n"
@@ -186,7 +185,7 @@ def start_background_worker():
                        "`/on`, `/off` : 시스템 켜기/끄기")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
-            # 2. [복구/강화] 실적 발표일 조회
+            # [수정됨] 실적 발표일 조회 (3중 데이터 백업 구조)
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
@@ -196,50 +195,80 @@ def start_background_worker():
                     bot.send_chat_action(m.chat.id, 'typing')
                     
                     stock = yf.Ticker(t)
-                    # 데이터 가져오기 (earnings_dates 사용)
-                    dates = stock.earnings_dates
-                    if dates is None or dates.empty:
-                        return bot.reply_to(m, f"❌ {t}: 예정된 실적 발표 정보가 없습니다.")
+                    msg = ""
                     
-                    # 타임존 제거 후 미래 날짜 필터링
-                    now = pd.Timestamp.now().normalize()
-                    if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
-                    
-                    future = dates[dates.index >= now].sort_index()
-                    
-                    if not future.empty:
-                        target = future.index[0] # 가장 가까운 미래
-                        record = future.loc[target]
-                        
-                        d_str = target.strftime('%Y-%m-%d')
-                        t_str = target.strftime('%H:%M')
-                        
-                        # 시간대 추측 (오전이면 장전, 오후면 장후)
-                        timing = "시간 미정"
-                        if target.hour < 12: timing = "☀️ 장 시작 전"
-                        elif target.hour >= 12: timing = "🌙 장 마감 후"
-                        if target.hour == 0: timing = "시간 미정"
+                    # 1단계: earnings_dates (가장 상세함)
+                    try:
+                        dates = stock.earnings_dates
+                        if dates is not None and not dates.empty:
+                            # 타임존 제거 (비교 에러 방지)
+                            if dates.index.tz is not None:
+                                dates.index = dates.index.tz_localize(None)
+                            
+                            # 현재 이후의 미래 날짜 찾기
+                            now = pd.Timestamp.now()
+                            future = dates[dates.index >= now].sort_index()
+                            
+                            if not future.empty:
+                                target = future.index[0] # 가장 가까운 미래
+                                record = future.loc[target]
+                                
+                                d_str = target.strftime('%Y-%m-%d')
+                                
+                                # 시간대 아이콘
+                                timing = "시간 미정"
+                                if target.hour > 0:
+                                    timing = "☀️ 장 시작 전" if target.hour < 12 else "🌙 장 마감 후"
+                                
+                                # EPS 안전하게 가져오기 (Series일 경우 처리)
+                                eps_raw = record.get('EPS Estimate', 'N/A')
+                                if isinstance(eps_raw, pd.Series): eps_raw = eps_raw.iloc[0]
+                                eps = f"{eps_raw:.2f}" if isinstance(eps_raw, (int, float)) else "N/A"
 
-                        eps = record.get('EPS Estimate', 'N/A')
-                        if pd.isna(eps): eps = "N/A"
-                        
-                        rev = record.get('Revenue Estimate', 'N/A') # 일부 티커 지원
-                        
-                        msg = (f"📅 *{t} 실적 발표 예정*\n"
-                               f"────────────────\n"
-                               f"🗓️ 날짜: `{d_str}`\n"
-                               f"⏰ 시간: {timing}\n"
-                               f"💰 예상 EPS: `{eps}`\n"
-                               f"────────────────\n"
-                               f"_※ 현지 시간 기준입니다._")
+                                msg = (f"📅 *{t} 실적 발표 (확정)*\n"
+                                       f"────────────────\n"
+                                       f"🗓️ 날짜: `{d_str}`\n"
+                                       f"⏰ 시간: {timing}\n"
+                                       f"💰 예상 EPS: `{eps}`\n"
+                                       f"────────────────\n")
+                    except: pass
+
+                    # 2단계: 1단계 실패 시 calendar 사용 (보조)
+                    if not msg:
+                        try:
+                            cal = stock.calendar
+                            # 버전별 반환 타입 대응 (Dict vs DataFrame)
+                            if isinstance(cal, dict) and cal:
+                                d_date = cal.get('Earnings Date', [None])[0]
+                                eps_val = cal.get('Earnings Average', 'N/A')
+                                if d_date:
+                                    msg = (f"📅 *{t} 실적 발표 (예상)*\n"
+                                           f"🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`\n"
+                                           f"💰 예상 EPS: `{eps_val}`\n")
+                            elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                                d_date = cal.iloc[0, 0]
+                                msg = (f"📅 *{t} 실적 발표 (예상)*\n"
+                                       f"🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`\n")
+                        except: pass
+                    
+                    # 3단계: info에서 검색 (최후의 수단)
+                    if not msg:
+                        try:
+                            info = stock.info
+                            if 'earningsTimestamp' in info:
+                                ts = info['earningsTimestamp']
+                                d_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+                                msg = f"📅 *{t} 실적 발표 예정*\n🗓️ 날짜: `{d_str}` (세부 정보 없음)"
+                        except: pass
+
+                    if msg:
+                        bot.reply_to(m, msg + "\n_※ 현지 시간 기준입니다._", parse_mode='Markdown')
                     else:
-                        msg = f"⚠️ {t}: 향후 예정된 발표일이 확인되지 않습니다."
-                        
-                    bot.reply_to(m, msg, parse_mode='Markdown')
-                except Exception as e:
-                    bot.reply_to(m, f"❌ 조회 중 오류 발생: {e}")
+                        bot.reply_to(m, f"❌ *{t}*의 예정된 발표일 정보를 찾을 수 없습니다.\n(ETF나 리츠는 정보가 없을 수 있습니다)")
 
-            # 3. [신규] 재무 요약 (Summary)
+                except Exception as e:
+                    bot.reply_to(m, f"❌ 오류 발생: {e}")
+
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
@@ -251,10 +280,9 @@ def start_background_worker():
                     info = yf.Ticker(t).info
                     if not info: return bot.reply_to(m, "❌ 정보를 찾을 수 없습니다.")
                     
-                    # 데이터 안전하게 가져오기
                     def safe_get(key, fmt="{:,.2f}"):
                         val = info.get(key)
-                        return fmt.format(val) if val is not None else "N/A"
+                        return fmt.format(val) if val is not None and isinstance(val, (int, float)) else "N/A"
                     
                     curr = safe_get('currentPrice')
                     pe = safe_get('trailingPE')
@@ -273,7 +301,6 @@ def start_background_worker():
                     bot.reply_to(m, msg, parse_mode='Markdown')
                 except: bot.reply_to(m, "❌ 데이터 조회 실패")
 
-            # 4. [신규] VIX 지수
             @bot.message_handler(commands=['vix'])
             def vix_cmd(m):
                 try:
@@ -285,7 +312,6 @@ def start_background_worker():
                     bot.reply_to(m, f"{emoji} *VIX (공포지수)*: `{curr:.2f}` ({pct:+.2f}%)", parse_mode='Markdown')
                 except: pass
 
-            # 5. 기존 명령어 (add, del, news, sec, p, market, list, on/off)
             @bot.message_handler(commands=['add'])
             def add_cmd(m):
                 try:
@@ -372,7 +398,6 @@ def start_background_worker():
                 save_config(c)
                 bot.reply_to(m, "🟢 시스템 가동" if is_on else "⛔ 시스템 정지")
 
-            # 메뉴 등록 (상세 설명 포함)
             try:
                 bot.set_my_commands([
                     BotCommand("earning", "📅 실적 발표일 (EPS/매출)"),
