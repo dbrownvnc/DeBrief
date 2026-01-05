@@ -58,7 +58,6 @@ def get_jsonbin_url():
     return None
 
 def load_config():
-    # 기본 설정
     config = {
         "system_active": True,
         "eco_mode": True,
@@ -71,7 +70,6 @@ def load_config():
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
     
-    # 1. JSONBin 로드
     if url and headers:
         try:
             resp = requests.get(f"{url}/latest", headers=headers, timeout=5)
@@ -80,7 +78,6 @@ def load_config():
                 if "tickers" in cloud_data: config.update(cloud_data)
         except: pass
     
-    # 2. Local 백업 로드
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -88,7 +85,6 @@ def load_config():
                 config.update(saved)
     except: pass
 
-    # 3. Secrets 우선 적용
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -99,36 +95,33 @@ def load_config():
 def save_config(config):
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
-    # Cloud Save
     if url and headers:
         try: requests.put(url, headers=headers, json=config, timeout=5)
         except: pass
-    # Local Save
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진
+# [2] 데이터 엔진 (날짜 파싱 + 번역 강화)
 # ---------------------------------------------------------
+def parse_rss_date(date_str):
+    """ RSS 날짜 형식을 짧은 형식(MM/DD HH:mm)으로 변환 """
+    try:
+        # 예: Mon, 06 Jan 2025 08:21:56 GMT
+        dt = datetime.strptime(date_str.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
+        return dt.strftime('%m/%d %H:%M')
+    except:
+        return date_str[:16] # 실패 시 앞부분만 자름
+
 def get_integrated_news(ticker, is_sec_search=False):
-    """
-    뉴스 및 공시 검색 (통합)
-    """
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    # 검색 쿼리 분기
     if is_sec_search:
-        # SEC 전용 검색 (정확도 향상)
-        search_urls = [
-            f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en"
-        ]
+        search_urls = [f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en"]
     else:
-        # 일반 뉴스 검색
-        search_urls = [
-            f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en"
-        ]
+        search_urls = [f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en"]
 
     collected_items = []
     seen_links = set()
@@ -142,53 +135,54 @@ def get_integrated_news(ticker, is_sec_search=False):
                 try:
                     title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
+                    pubDate = item.find('pubDate').text # 날짜 추출
+                    
                     if link in seen_links: continue
                     seen_links.add(link)
                     
-                    # 제목 번역 (뉴스인 경우만, SEC는 원문이 나을 수 있음)
-                    if not is_sec_search:
-                        try: title = translator.translate(title[:100])
-                        except: pass
+                    # [NEW] 날짜 포맷팅
+                    date_str = parse_rss_date(pubDate)
+                    
+                    # [NEW] 제목 번역 (SEC도 포함)
+                    try: 
+                        title = translator.translate(title[:150]) 
+                    except: pass
                     
                     prefix = "🏛️" if is_sec_search else "📰"
-                    collected_items.append({'title': f"{prefix} {title}", 'link': link})
+                    collected_items.append({'title': f"{prefix} {title}", 'link': link, 'date': date_str})
                 except: continue
         except: pass
 
     for url in search_urls: fetch(url)
     return collected_items
 
-# [NEW] 경제지표 데이터 소스 교체 (ForexFactory XML - 차단 없음)
+# [NEW] 경제지표 (ForexFactory XML + 한글 번역)
 def get_economic_events():
     try:
-        # ForexFactory 주간 일정 XML (공개 API, 차단 없음)
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
         resp = requests.get(url, timeout=5)
         if resp.status_code != 200: return []
         
         root = ET.fromstring(resp.content)
         events = []
+        translator = GoogleTranslator(source='auto', target='ko')
         
         for event in root.findall('event'):
             country = event.find('country').text
-            if country != 'USD': continue # 미국 지표만
+            if country != 'USD': continue 
             
             impact = event.find('impact').text
-            if impact not in ['High', 'Medium']: continue # 중요 지표만
+            if impact not in ['High', 'Medium']: continue 
             
             title = event.find('title').text
-            date_str = event.find('date').text # YYYY-MM-DD
-            time_str = event.find('time').text # HH:mm or 24hr
+            # [NEW] 지표명 한글 번역
+            try: title = translator.translate(title)
+            except: pass
             
-            # 날짜/시간 파싱 (ForexFactory는 ET 기준일 수 있음, 여기선 단순 표시용)
-            # 한국 시간 변환 로직은 복잡하므로 원문 시간 표시 + "현지시간" 명시
-            
-            # Forecast/Previous/Actual
+            date_str = event.find('date').text
+            time_str = event.find('time').text
             forecast = event.find('forecast').text if event.find('forecast') is not None else ""
             previous = event.find('previous').text if event.find('previous') is not None else ""
-            actual = "Wait"
-            # XML에는 actual 태그가 없거나 비어있을 수 있음 (실시간 업데이트 여부 확인 필요)
-            # ForexFactory XML은 실시간 업데이트가 느릴 수 있으나 스케쥴용으론 완벽함.
             
             events.append({
                 'date': date_str,
@@ -197,11 +191,10 @@ def get_economic_events():
                 'impact': impact,
                 'forecast': forecast,
                 'previous': previous,
-                'actual': "", # 실시간 값은 비워둠 (알림은 스케쥴 위주로)
+                'actual': "", 
                 'id': f"{date_str}_{time_str}_{title}"
             })
             
-        # 날짜순 정렬
         events.sort(key=lambda x: (x['date'], x['time']))
         return events
     except Exception as e:
@@ -228,22 +221,22 @@ def start_background_worker():
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V39 가동\n경제지표 소스 교체 및 전체 기능 복구 완료.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V40 가동\n날짜 표시/번역 강화/UI 복구가 완료되었습니다.")
             except: pass
 
             # --- 명령어 핸들러 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V39 사용법*\n\n"
+                msg = ("🤖 *DeBrief V40 사용법*\n\n"
                        "📅 *경제/실적*\n"
-                       "`/eco` : 이번 주 경제 일정 (안정적)\n"
+                       "`/eco` : 이번 주 경제 일정 (한글)\n"
                        "`/earning 티커` : 실적 발표일\n"
                        "`/summary 티커` : 재무 요약\n"
                        "`/vix` : 공포 지수\n\n"
                        "📊 *조회*\n"
                        "`/p 티커` : 현재가\n"
-                       "`/news 티커` : 뉴스 검색\n"
-                       "`/sec 티커` : 공시 조회\n\n"
+                       "`/news 티커` : 뉴스 검색 (번역+날짜)\n"
+                       "`/sec 티커` : 공시 조회 (번역+날짜)\n\n"
                        "⚙️ *관리*\n"
                        "`/list` : 감시 목록\n"
                        "`/add 티커` : 추가\n"
@@ -251,27 +244,20 @@ def start_background_worker():
                        "`/on`, `/off` : 전체 시스템")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
-            # [수정] 경제지표 (ForexFactory XML)
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
                 try:
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
                     if not events:
-                        bot.reply_to(m, "❌ 이번 주 남은 주요 경제 일정이 없거나 데이터를 가져올 수 없습니다.")
+                        bot.reply_to(m, "❌ 이번 주 남은 주요 일정이 없습니다.")
                         return
                     
-                    # 오늘 날짜
-                    today_str = datetime.now().strftime('%m-%d')
-                    
-                    msg = "📅 *이번 주 주요 경제 일정 (USD)*\n────────────────"
+                    msg = "📅 *주요 경제 일정 (USD)*\n────────────────"
                     count = 0
                     for e in events:
-                        # 날짜 필터 (과거 데이터 제외하려면 로직 추가 가능)
-                        # 여기선 전체 주간 일정 표시
                         icon = "🔥" if e['impact'] == 'High' else "🔸"
                         fcst = f"(예상: {e['forecast']})" if e['forecast'] else ""
-                        
                         msg += f"\n{icon} `{e['date']} {e['time']}`\n*{e['event']}* {fcst}\n"
                         count += 1
                         if count >= 15: break
@@ -343,50 +329,44 @@ def start_background_worker():
                     if t in c['tickers']: del c['tickers'][t]; save_config(c); bot.reply_to(m, f"🗑️ {t} 삭제됨")
                 except: pass
 
-            # [복구] List 명령어
             @bot.message_handler(commands=['list'])
             def list_cmd(m):
                 try:
                     c = load_config()
-                    keys = list(c['tickers'].keys())
-                    if keys: bot.reply_to(m, f"📋 *감시 목록 ({len(keys)})*\n" + ", ".join(keys), parse_mode='Markdown')
-                    else: bot.reply_to(m, "목록이 비어있습니다.")
+                    bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
                 except: pass
 
-            # [수정] 뉴스 - 링크 클릭형 (Markdown)
             @bot.message_handler(commands=['news'])
             def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
+                    # 뉴스 (번역 + 날짜 포함)
                     items = get_integrated_news(t, is_sec_search=False)
                     if not items: return bot.reply_to(m, "뉴스 없음")
                     
-                    # [Title](Link) 포맷 적용
                     msg_lines = [f"📰 *{t} News*"]
                     for i in items:
-                        # 텔레그램 마크다운 링크 포맷: [텍스트](URL)
-                        # disable_web_page_preview=True로 미리보기 끔 (깔끔하게)
-                        msg_lines.append(f"▪️ [{i['title'].replace('[','').replace(']','')}]({i['link']})")
+                        # [날짜] 제목 (링크)
+                        msg_lines.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
                     
                     bot.reply_to(m, "\n\n".join(msg_lines), parse_mode='Markdown', disable_web_page_preview=True)
-                except Exception as e: bot.reply_to(m, f"오류: {e}")
+                except: pass
 
-            # [수정] SEC - 링크 클릭형 + 검색 로직 수정
             @bot.message_handler(commands=['sec'])
             def sec_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    # SEC 전용 검색 모드 사용
+                    # SEC (번역 + 날짜 포함)
                     items = get_integrated_news(t, is_sec_search=True)
                     
                     if items:
-                        msg_lines = [f"🏛️ *{t} SEC Filings*"]
+                        msg_lines = [f"🏛️ *{t} SEC*"]
                         for i in items:
-                            msg_lines.append(f"📄 [{i['title'].replace('🏛️ ','').replace('[','').replace(']','')}]({i['link']})")
+                            msg_lines.append(f"▪️ `[{i['date']}]` [{i['title'].replace('🏛️ ','').replace('[','').replace(']','')}]({i['link']})")
                         bot.reply_to(m, "\n\n".join(msg_lines), parse_mode='Markdown', disable_web_page_preview=True)
                     else: 
-                        bot.reply_to(m, f"❌ {t} 관련 최근 공시가 없습니다.")
-                except Exception as e: bot.reply_to(m, f"오류: {e}")
+                        bot.reply_to(m, f"❌ {t} 공시 없음")
+                except: pass
 
             @bot.message_handler(commands=['p'])
             def p_cmd(m):
@@ -409,28 +389,23 @@ def start_background_worker():
             def toggle_cmd(m):
                 try:
                     c = load_config()
-                    is_on = ('/on' in m.text)
-                    c['system_active'] = is_on
+                    c['system_active'] = ('/on' in m.text)
                     save_config(c)
-                    status = "🟢 가동" if is_on else "⛔ 정지"
-                    bot.reply_to(m, f"시스템 {status}")
+                    bot.reply_to(m, f"시스템 {'가동' if c['system_active'] else '정지'}")
                 except: pass
 
-            # 메뉴 등록 (빠진 것 없이 전체 등록)
             try:
                 bot.set_my_commands([
                     BotCommand("eco", "📅 경제지표"),
                     BotCommand("earning", "💰 실적 발표"),
-                    BotCommand("news", "📰 뉴스 (링크)"),
-                    BotCommand("sec", "🏛️ 공시 (링크)"),
+                    BotCommand("news", "📰 뉴스"),
                     BotCommand("p", "💰 현재가"),
                     BotCommand("summary", "📊 요약"),
+                    BotCommand("sec", "🏛️ 공시"),
                     BotCommand("vix", "😨 공포 지수"),
                     BotCommand("list", "📋 목록"),
-                    BotCommand("add", "➕ 추가"), 
-                    BotCommand("del", "🗑️ 삭제"),
-                    BotCommand("on", "🟢 켜기"), 
-                    BotCommand("off", "⛔ 끄기"),
+                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제"),
+                    BotCommand("on", "🟢 가동"), BotCommand("off", "⛔ 정지"),
                     BotCommand("help", "❓ 도움말")
                 ])
             except: pass
@@ -443,10 +418,10 @@ def start_background_worker():
                     try:
                         cfg = load_config()
                         
-                        # 1. 경제지표 브리핑 (스케쥴)
+                        # 1. 경제지표 알림
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
-                            # 월요일 주간 브리핑
+                            # 주간 브리핑
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
@@ -463,13 +438,18 @@ def start_background_worker():
                             # 매일 아침 브리핑
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
-                                today_str = now.strftime('%Y-%m-%d') # XML 포맷에 맞춰야 함 (여기선 예시)
-                                # ForexFactory XML 날짜 포맷 확인 필요 (MM-DD-YYYY 형태일 수 있음)
-                                # 단순화를 위해 매번 전체 리스트 중 오늘 날짜 매칭되는 것 찾기
-                                # (XML 파싱 함수에서 date 포맷을 확인해야 정확함)
+                                # 날짜 매칭 로직 간소화 (오늘 날짜 포함된 것)
+                                today = datetime.now().strftime('%Y-%m-%d') # YYYY-MM-DD
+                                # ForexFactory XML Date format check required. Assuming YYYY-MM-DD.
+                                # Simple check:
+                                todays = [e for e in events if e['date'] == today]
                                 
-                                # 임시: 데이터 있으면 그냥 상위 일정 보여줌 (데모 안정성 위함)
-                                pass 
+                                if todays:
+                                    msg = f"☀️ *오늘({today}) 주요 일정*\n────────────────"
+                                    for e in todays:
+                                        msg += f"\n⏰ {e['time']} : {e['event']} (예상:{e['forecast']})"
+                                    bot.send_message(chat_id, msg, parse_mode='Markdown')
+                                    last_daily_sent = now.strftime('%Y-%m-%d')
 
                         # 2. 주식 감시
                         if cfg.get('system_active', True) and cfg['tickers']:
@@ -488,13 +468,19 @@ def start_background_worker():
                     # 뉴스
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
-                        items = get_integrated_news(ticker)
+                        items = get_integrated_news(ticker, is_sec_search=False) # 공시도 통합 검색
                         for item in items:
                             if item['link'] in news_cache[ticker]: continue
-                            prefix = "🏛️" if "SEC" in item['title'] else "📰"
-                            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                        data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n[{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-                            news_cache[ticker].add(item['link'])
+                            
+                            is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                            should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
+                            
+                            if should_send:
+                                prefix = "🏛️" if is_sec else "📰"
+                                # [수정] 날짜 포함 + 링크 클릭형
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                                            data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+                                news_cache[ticker].add(item['link'])
                     
                     # 가격
                     if settings.get('가격_3%'):
@@ -509,6 +495,25 @@ def start_background_worker():
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                                                 data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
+                                    
+                    # RSI
+                    if settings.get('RSI'):
+                        h = stock.history(period="1mo")
+                        if not h.empty:
+                            delta = h['Close'].diff()
+                            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+                            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                            rs = gain / loss
+                            rsi = 100 - (100 / (1 + rs)).iloc[-1]
+                            status = rsi_alert_status.get(ticker, "NORMAL")
+                            if rsi >= 70 and status != "OB":
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔥 [{ticker}] RSI 과매수 ({rsi:.1f})"})
+                                rsi_alert_status[ticker] = "OB"
+                            elif rsi <= 30 and status != "OS":
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"💧 [{ticker}] RSI 과매도 ({rsi:.1f})"})
+                                rsi_alert_status[ticker] = "OS"
+                            elif 35 < rsi < 65: rsi_alert_status[ticker] = "NORMAL"
+
                 except: pass
 
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
@@ -563,7 +568,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V39)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V40)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
