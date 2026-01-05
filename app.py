@@ -109,6 +109,7 @@ def save_config(config):
 # ---------------------------------------------------------
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
+    
     if is_sec_search:
         search_urls = [f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en"]
     else:
@@ -126,41 +127,59 @@ def get_integrated_news(ticker, is_sec_search=False):
                 try:
                     title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
+                    pubDate = item.find('pubDate').text
+                    
                     if link in seen_links: continue
                     seen_links.add(link)
+                    
+                    # 날짜 포맷
+                    try:
+                        dt = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
+                        date_str = dt.strftime('%m/%d %H:%M')
+                    except: date_str = pubDate[:16]
+                    
+                    # 번역
                     if not is_sec_search:
-                        try: title = translator.translate(title[:100])
+                        try: title = translator.translate(title[:150]) 
                         except: pass
+                    
                     prefix = "🏛️" if is_sec_search else "📰"
-                    collected_items.append({'title': f"{prefix} {title}", 'link': link})
+                    collected_items.append({'title': f"{prefix} {title}", 'link': link, 'date': date_str})
                 except: continue
         except: pass
 
     for url in search_urls: fetch(url)
     return collected_items
 
-# 경제지표 (ForexFactory XML)
+# 경제지표 (Cloudscraper)
 def get_economic_events():
     try:
+        scraper = cloudscraper.create_scraper()
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        resp = requests.get(url, timeout=5)
+        resp = scraper.get(url)
         if resp.status_code != 200: return []
+        
         root = ET.fromstring(resp.content)
         events = []
+        translator = GoogleTranslator(source='auto', target='ko')
+        
         for event in root.findall('event'):
             if event.find('country').text != 'USD': continue
             if event.find('impact').text not in ['High', 'Medium']: continue
             
             title = event.find('title').text
-            date_str = event.find('date').text
-            time_str = event.find('time').text
-            forecast = event.find('forecast').text if event.find('forecast') is not None else ""
-            previous = event.find('previous').text if event.find('previous') is not None else ""
+            try: title = translator.translate(title)
+            except: pass
             
             events.append({
-                'date': date_str, 'time': time_str, 'event': title,
-                'impact': event.find('impact').text, 'forecast': forecast,
-                'previous': previous, 'actual': "", 'id': f"{date_str}_{time_str}_{title}"
+                'date': event.find('date').text,
+                'time': event.find('time').text,
+                'event': title,
+                'impact': event.find('impact').text,
+                'forecast': event.find('forecast').text or "",
+                'previous': event.find('previous').text or "",
+                'actual': "", 
+                'id': f"{event.find('date').text}_{event.find('time').text}_{title}"
             })
         events.sort(key=lambda x: (x['date'], x['time']))
         return events
@@ -184,19 +203,21 @@ def start_background_worker():
         
         try:
             bot = telebot.TeleBot(token)
+            
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V41 가동\n명령어(earning, summary) 수정 완료.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V41 가동\n명령어 기능이 정상화되었습니다.")
             except: pass
 
+            # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
                 msg = ("🤖 *DeBrief V41 사용법*\n\n"
                        "📅 *경제/실적*\n"
                        "`/eco` : 이번 주 경제 일정\n"
-                       "`/earning 티커` : 실적 발표일\n"
-                       "`/summary 티커` : 재무 요약\n"
+                       "`/earning 티커` : 실적 발표일 (수정됨)\n"
+                       "`/summary 티커` : 재무 요약 (수정됨)\n"
                        "`/vix` : 공포 지수\n\n"
                        "📊 *조회*\n"
                        "`/p 티커` : 현재가\n"
@@ -209,14 +230,129 @@ def start_background_worker():
                        "`/on`, `/off` : 전체 시스템")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
+            # [수정된] /earning 명령어 (안전장치 추가)
+            @bot.message_handler(commands=['earning', '실적'])
+            def earning_cmd(m):
+                try:
+                    parts = m.text.split()
+                    if len(parts) < 2: 
+                        return bot.reply_to(m, "사용법: /earning [티커]")
+                    t = parts[1].upper()
+                    bot.send_chat_action(m.chat.id, 'typing')
+                    
+                    stock = yf.Ticker(t)
+                    msg = None
+
+                    # 1순위: earnings_dates (상세 정보)
+                    try:
+                        dates = stock.earnings_dates
+                        if dates is not None and not dates.empty:
+                            if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
+                            future = dates[dates.index >= pd.Timestamp.now()].sort_index()
+                            if not future.empty:
+                                target = future.index[0]
+                                rec = future.loc[target]
+                                est = rec.get('EPS Estimate', 'N/A')
+                                if pd.isna(est): est = 'N/A'
+                                
+                                # 시간대 아이콘
+                                timing = "시간 미정"
+                                if target.hour > 0:
+                                    timing = "☀️ 장전" if target.hour < 12 else "🌙 장후"
+
+                                msg = (f"📅 *{t} 실적 발표 (확정)*\n"
+                                       f"🗓️ `{target.strftime('%Y-%m-%d')}` ({timing})\n"
+                                       f"💰 예상 EPS: `{est}`")
+                    except: pass
+
+                    # 2순위: calendar (백업)
+                    if not msg:
+                        try:
+                            cal = stock.calendar
+                            # DataFrame 형태 대응
+                            if isinstance(cal, pd.DataFrame) and not cal.empty:
+                                d_date = cal.iloc[0, 0] # 보통 첫번째 컬럼이 날짜
+                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ `{d_date.strftime('%Y-%m-%d')}`"
+                            # Dictionary 형태 대응
+                            elif isinstance(cal, dict) and 'Earnings Date' in cal:
+                                dates_list = cal['Earnings Date']
+                                if dates_list:
+                                    msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ `{dates_list[0].strftime('%Y-%m-%d')}`"
+                        except: pass
+
+                    if msg:
+                        bot.reply_to(m, msg, parse_mode='Markdown')
+                    else:
+                        bot.reply_to(m, f"❌ {t}: 예정된 실적 발표 정보를 찾을 수 없습니다.")
+
+                except Exception as e:
+                    bot.reply_to(m, f"오류 발생: {e}")
+
+            # [수정된] /summary 명령어 (빠른 조회 + 시총 포맷팅)
+            @bot.message_handler(commands=['summary', '요약'])
+            def summary_cmd(m):
+                try:
+                    parts = m.text.split()
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary [티커]")
+                    t = parts[1].upper()
+                    bot.send_chat_action(m.chat.id, 'typing')
+                    
+                    stock = yf.Ticker(t)
+                    
+                    # 1. fast_info로 현재가 먼저 확보
+                    try:
+                        curr = stock.fast_info.last_price
+                    except: curr = None
+
+                    # 2. info로 상세 정보 시도
+                    try:
+                        i = stock.info
+                    except: i = {}
+
+                    if not i and curr is None:
+                        return bot.reply_to(m, "❌ 정보를 찾을 수 없습니다.")
+
+                    # 값 추출 헬퍼
+                    def get_val(key, default="N/A"):
+                        return i.get(key, default) if i else default
+
+                    # 데이터 바인딩
+                    price = curr if curr else get_val('currentPrice')
+                    pe = get_val('trailingPE')
+                    pbr = get_val('priceToBook')
+                    cap = get_val('marketCap')
+                    target = get_val('targetMeanPrice')
+
+                    # 포맷팅 함수
+                    def fmt(v, is_money=False):
+                        if isinstance(v, (int, float)):
+                            return f"${v:,.2f}" if is_money else f"{v:.2f}"
+                        return "N/A"
+
+                    # 시가총액 포맷팅 (Billion 단위)
+                    cap_str = "N/A"
+                    if isinstance(cap, (int, float)):
+                        cap_str = f"${cap/1e9:.2f}B" # Billions
+
+                    msg = (f"📊 *{t} 재무 요약*\n"
+                           f"💰 현재가: `{fmt(price, True)}`\n"
+                           f"🏢 시총: `{cap_str}`\n"
+                           f"📈 PER: `{fmt(pe)}`\n"
+                           f"📚 PBR: `{fmt(pbr)}`\n"
+                           f"🎯 목표가: `{fmt(target, True)}`")
+                    
+                    bot.reply_to(m, msg, parse_mode='Markdown')
+
+                except Exception as e:
+                    bot.reply_to(m, f"❌ 조회 실패: {e}")
+
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
                 try:
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
-                    if not events:
-                        bot.reply_to(m, "❌ 이번 주 남은 주요 경제 일정이 없습니다.")
-                        return
+                    if not events: return bot.reply_to(m, "❌ 일정 없음")
+                    
                     msg = "📅 *주요 경제 일정 (USD)*\n────────────────"
                     count = 0
                     for e in events:
@@ -227,109 +363,6 @@ def start_background_worker():
                         if count >= 15: break
                     bot.reply_to(m, msg, parse_mode='Markdown')
                 except: bot.reply_to(m, "오류 발생")
-
-            # [수정] earning 명령어 (안정적인 Calendar 우선 방식)
-            @bot.message_handler(commands=['earning', '실적'])
-            def earning_cmd(m):
-                try:
-                    parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: `/earning 티커`")
-                    t = parts[1].upper()
-                    bot.send_chat_action(m.chat.id, 'typing')
-                    
-                    stock = yf.Ticker(t)
-                    msg_body = ""
-                    
-                    # 1. Calendar (가장 최신/다음 분기 예정일)
-                    try:
-                        cal = stock.calendar
-                        # yfinance 버전에 따라 cal이 dict 또는 DataFrame일 수 있음
-                        if isinstance(cal, dict) and 'Earnings Date' in cal:
-                            dates = cal['Earnings Date']
-                            d = dates[0] if isinstance(dates, list) else dates
-                            msg_body = f"🗓️ 예정일: `{d.strftime('%Y-%m-%d')}`\n(Calendar Data)"
-                        elif isinstance(cal, pd.DataFrame) and not cal.empty:
-                            d = cal.iloc[0, 0]
-                            msg_body = f"🗓️ 예정일: `{d.strftime('%Y-%m-%d')}`\n(Calendar Data)"
-                    except: pass
-
-                    # 2. Earnings Dates (이력 데이터) - Calendar 실패 시 시도
-                    if not msg_body:
-                        try:
-                            dates = stock.earnings_dates
-                            if dates is not None and not dates.empty:
-                                if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
-                                future = dates[dates.index >= pd.Timestamp.now()].sort_index()
-                                if not future.empty:
-                                    target = future.index[0]
-                                    rec = future.loc[target]
-                                    est = rec.get('EPS Estimate', 'N/A')
-                                    if pd.isna(est): est = 'N/A'
-                                    # 시간대 추정
-                                    timing = "시간 미정"
-                                    if target.hour > 0:
-                                        timing = "☀️ 장전" if target.hour < 12 else "🌙 장후"
-                                    msg_body = f"🗓️ 예정일: `{target.strftime('%Y-%m-%d')}` ({timing})\n💰 예상 EPS: `{est}`"
-                        except: pass
-                    
-                    if msg_body:
-                        bot.reply_to(m, f"📅 *{t} 차기 실적 발표*\n{msg_body}", parse_mode='Markdown')
-                    else:
-                        bot.reply_to(m, f"❌ *{t}*의 실적 발표 일정을 찾을 수 없습니다.\n(ETF나 리츠는 정보가 없을 수 있습니다)")
-                        
-                except Exception as e:
-                    bot.reply_to(m, f"⚠️ 오류 발생: {e}")
-
-            # [수정] summary 명령어 (예외 처리 강화)
-            @bot.message_handler(commands=['summary', '요약'])
-            def summary_cmd(m):
-                try:
-                    parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: `/summary 티커`")
-                    t = parts[1].upper()
-                    bot.send_chat_action(m.chat.id, 'typing')
-                    
-                    stock = yf.Ticker(t)
-                    info = stock.info
-                    
-                    if not info or len(info) < 5: # 데이터가 비어있거나 너무 적으면 실패로 간주
-                        bot.reply_to(m, f"❌ {t}: 정보를 불러올 수 없습니다.")
-                        return
-
-                    # 안전하게 값 가져오기 함수
-                    def get_val(key, fmt="{:,.2f}", default="N/A"):
-                        val = info.get(key)
-                        if val is None: return default
-                        try: return fmt.format(val)
-                        except: return str(val)
-
-                    curr = get_val('currentPrice')
-                    # 시총 조/억 단위 변환 (대략적)
-                    cap_raw = info.get('marketCap')
-                    cap = "N/A"
-                    if cap_raw:
-                        cap = f"${cap_raw/1e9:.2f}B"
-
-                    pe = get_val('trailingPE')
-                    fpe = get_val('forwardPE')
-                    pbr = get_val('priceToBook')
-                    target = get_val('targetMeanPrice')
-                    
-                    high52 = get_val('fiftyTwoWeekHigh')
-                    low52 = get_val('fiftyTwoWeekLow')
-
-                    msg = (f"📊 *{t} 재무 요약*\n"
-                           f"────────────────\n"
-                           f"💰 현재가: `${curr}`\n"
-                           f"🏢 시가총액: `{cap}`\n"
-                           f"📈 PER: `{pe}` (Forward: `{fpe}`)\n"
-                           f"📚 PBR: `{pbr}`\n"
-                           f"🎯 목표주가: `${target}`\n"
-                           f"🌊 52주 범위: `${low52} ~ ${high52}`")
-                    
-                    bot.reply_to(m, msg, parse_mode='Markdown')
-                except Exception as e:
-                    bot.reply_to(m, f"❌ 데이터 조회 실패: {e}")
 
             @bot.message_handler(commands=['vix'])
             def vix_cmd(m):
@@ -367,9 +400,11 @@ def start_background_worker():
             def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    items = get_integrated_news(t)
-                    msg = f"📰 *{t} News*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in items])
-                    bot.reply_to(m, msg, parse_mode='Markdown', disable_web_page_preview=True)
+                    items = get_integrated_news(t, is_sec_search=False)
+                    if not items: return bot.reply_to(m, "뉴스 없음")
+                    msg = [f"📰 *{t} News*"]
+                    for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
+                    bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
                 except: pass
 
             @bot.message_handler(commands=['sec'])
@@ -378,9 +413,10 @@ def start_background_worker():
                     t = m.text.split()[1].upper()
                     items = get_integrated_news(t, is_sec_search=True)
                     if items:
-                        msg = f"🏛️ *{t} SEC*\n" + "\n".join([f"- [{i['title']}]({i['link']})" for i in items])
-                        bot.reply_to(m, msg, parse_mode='Markdown', disable_web_page_preview=True)
-                    else: bot.reply_to(m, "공시 없음")
+                        msg = [f"🏛️ *{t} SEC*"]
+                        for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('🏛️ ','').replace('[','').replace(']','')}]({i['link']})")
+                        bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
+                    else: bot.reply_to(m, f"❌ {t} 공시 없음")
                 except: pass
 
             @bot.message_handler(commands=['p'])
@@ -404,7 +440,8 @@ def start_background_worker():
             def toggle_cmd(m):
                 try:
                     c = load_config()
-                    c['system_active'] = ('/on' in m.text)
+                    is_on = ('/on' in m.text)
+                    c['system_active'] = is_on
                     save_config(c)
                     bot.reply_to(m, f"시스템 {'가동' if c['system_active'] else '정지'}")
                 except: pass
@@ -425,14 +462,18 @@ def start_background_worker():
                 ])
             except: pass
 
+            # --- 감시 루프 ---
             def monitor_loop():
                 nonlocal last_weekly_sent, last_daily_sent
+                
                 while True:
                     try:
                         cfg = load_config()
+                        
+                        # 1. 경제지표 알림
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
-                            # Weekly
+                            # 주간 브리핑
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
@@ -445,7 +486,8 @@ def start_background_worker():
                                     if c > 0:
                                         bot.send_message(chat_id, msg, parse_mode='Markdown')
                                         last_weekly_sent = now.strftime('%Y-%m-%d')
-                            # Daily
+
+                            # 매일 아침 브리핑
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 today = datetime.now().strftime('%Y-%m-%d')
@@ -457,28 +499,37 @@ def start_background_worker():
                                     bot.send_message(chat_id, msg, parse_mode='Markdown')
                                     last_daily_sent = now.strftime('%Y-%m-%d')
 
+                        # 2. 주식 감시
                         if cfg.get('system_active', True) and cfg['tickers']:
                             cur_token = cfg['telegram']['bot_token']
                             cur_chat = cfg['telegram']['chat_id']
                             with ThreadPoolExecutor(max_workers=5) as exe:
                                 for t, s in cfg['tickers'].items():
                                     exe.submit(analyze_ticker, t, s, cur_token, cur_chat)
+                                    
                     except Exception as e: write_log(f"Loop Err: {e}")
                     time.sleep(60)
 
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
+                    # 뉴스
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
-                        items = get_integrated_news(ticker)
+                        items = get_integrated_news(ticker, is_sec_search=False)
                         for item in items:
                             if item['link'] in news_cache[ticker]: continue
-                            prefix = "🏛️" if "SEC" in item['title'] else "📰"
-                            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                        data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n[{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-                            news_cache[ticker].add(item['link'])
+                            
+                            is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                            should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
+                            
+                            if should_send:
+                                prefix = "🏛️" if is_sec else "📰"
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                                            data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+                                news_cache[ticker].add(item['link'])
                     
+                    # 가격
                     if settings.get('가격_3%'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
@@ -491,7 +542,8 @@ def start_background_worker():
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                                                 data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
-                    
+                                    
+                    # RSI
                     if settings.get('RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
@@ -508,6 +560,7 @@ def start_background_worker():
                                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"💧 [{ticker}] RSI 과매도 ({rsi:.1f})"})
                                 rsi_alert_status[ticker] = "OS"
                             elif 35 < rsi < 65: rsi_alert_status[ticker] = "NORMAL"
+
                 except: pass
 
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
@@ -538,10 +591,8 @@ config = load_config()
 
 with st.sidebar:
     st.header("🎛️ Control Panel")
-    if "jsonbin" in st.secrets:
-        st.success("☁️ Cloud Connected")
-    else:
-        st.warning("📂 Local Mode")
+    if "jsonbin" in st.secrets: st.success("☁️ Cloud Connected")
+    else: st.warning("📂 Local Mode")
 
     if st.toggle("System Power", value=config.get('system_active', True)):
         st.success("🟢 Active")
