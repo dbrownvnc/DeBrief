@@ -28,7 +28,7 @@ rsi_alert_status = st.session_state['rsi_alert_status']
 eco_alert_cache = st.session_state['eco_alert_cache']
 
 # ---------------------------------------------------------
-# [0] 로그 및 유틸
+# [0] 로그 기록
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -39,7 +39,7 @@ def write_log(msg):
     except: pass
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장 (자동 복구 로직 포함)
+# [1] 설정 로드/저장 (자동 마이그레이션 포함)
 # ---------------------------------------------------------
 def get_jsonbin_headers():
     try:
@@ -56,12 +56,38 @@ def get_jsonbin_url():
     except: pass
     return None
 
-# [핵심] 기본 옵션 템플릿 (복구용)
+# [핵심] 아이콘이 포함된 기본 옵션 (복구됨)
 DEFAULT_OPTS = {
-    "감시_ON": True, "뉴스": True, "SEC": True, "가격_3%": True,
-    "거래량_2배": False, "52주_신고가": True, "RSI": False,
-    "MA_크로스": False, "볼린저": False, "MACD": False
+    "🟢 감시": True, 
+    "📰 뉴스": True, 
+    "🏛️ SEC": True, 
+    "📈 급등락(3%)": True,
+    "📊 거래량(2배)": False, 
+    "🚀 신고가": True, 
+    "📉 RSI": False,
+    "〰️ MA크로스": False, 
+    "🛁 볼린저": False, 
+    "🌊 MACD": False
 }
+
+def migrate_options(old_opts):
+    """구버전 키(아이콘 없음)를 신버전(아이콘 있음)으로 자동 변환"""
+    new_opts = DEFAULT_OPTS.copy()
+    # 매핑 테이블 (구 -> 신)
+    mapping = {
+        "감시_ON": "🟢 감시", "뉴스": "📰 뉴스", "SEC": "🏛️ SEC",
+        "가격_3%": "📈 급등락(3%)", "거래량_2배": "📊 거래량(2배)",
+        "52주_신고가": "🚀 신고가", "RSI": "📉 RSI", "MA_크로스": "〰️ MA크로스",
+        "볼린저": "🛁 볼린저", "MACD": "🌊 MACD"
+    }
+    
+    for old_k, val in old_opts.items():
+        if old_k in mapping:
+            new_opts[mapping[old_k]] = val # 구버전 값 승계
+        elif old_k in new_opts:
+            new_opts[old_k] = val # 이미 신버전 키라면 그대로
+            
+    return new_opts
 
 def load_config():
     # 기본 구조
@@ -73,40 +99,39 @@ def load_config():
             "TSLA": DEFAULT_OPTS.copy(),
             "NVDA": DEFAULT_OPTS.copy()
         },
-        "history": {"links": {}, "titles": {}}
+        "news_history": {}
     }
     
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
+    
+    loaded_data = None
     
     # 1. Cloud Load
     if url and headers:
         try:
             resp = requests.get(f"{url}/latest", headers=headers, timeout=5)
             if resp.status_code == 200:
-                cloud_data = resp.json()['record']
-                # 데이터 병합
-                if "telegram" in cloud_data: config['telegram'] = cloud_data['telegram']
-                if "system_active" in cloud_data: config['system_active'] = cloud_data['system_active']
-                if "eco_mode" in cloud_data: config['eco_mode'] = cloud_data['eco_mode']
-                if "history" in cloud_data: config['history'] = cloud_data['history']
-                
-                # [자동 복구 로직] 티커별 옵션 확인 및 누락된 항목 복구
-                if "tickers" in cloud_data:
-                    for t, opts in cloud_data['tickers'].items():
-                        # 기존 옵션 가져오기
-                        merged_opts = DEFAULT_OPTS.copy() # 기본값으로 초기화
-                        merged_opts.update(opts) # 클라우드 값 덮어쓰기 (누락된 키는 기본값 유지)
-                        config['tickers'][t] = merged_opts
+                loaded_data = resp.json()['record']
         except: pass
     
-    # 2. Local Backup Load (Cloud 실패 시)
-    elif os.path.exists(CONFIG_FILE):
+    # 2. Local Backup Load
+    if not loaded_data and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
-                config.update(saved)
+                loaded_data = json.load(f)
         except: pass
+
+    # 데이터 병합 및 마이그레이션
+    if loaded_data:
+        if "telegram" in loaded_data: config['telegram'] = loaded_data['telegram']
+        if "system_active" in loaded_data: config['system_active'] = loaded_data['system_active']
+        if "eco_mode" in loaded_data: config['eco_mode'] = loaded_data['eco_mode']
+        if "news_history" in loaded_data: config['news_history'] = loaded_data['news_history']
+        
+        if "tickers" in loaded_data:
+            for t, opts in loaded_data['tickers'].items():
+                config['tickers'][t] = migrate_options(opts)
 
     # 3. Secrets (최우선)
     try:
@@ -129,7 +154,7 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진 (V53 유지)
+# [2] 데이터 엔진
 # ---------------------------------------------------------
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -243,13 +268,14 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V54 가동\n설정 복구 및 기능 정상화 완료.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V55 가동\n아이콘 및 전체 기능 복구 완료.")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V54*\n"
-                       "/ping : 생존확인\n"
+                msg = ("🤖 *DeBrief V55*\n"
+                       "/on : 시스템 켜기 (복구됨)\n"
+                       "/off : 시스템 끄기 (복구됨)\n"
                        "/earning [티커] : 실적발표\n"
                        "/summary [티커] : 재무요약\n"
                        "/eco : 경제지표\n"
@@ -259,14 +285,10 @@ def start_background_worker():
                        "/list : 감시목록\n"
                        "/add [티커] : 추가\n"
                        "/del [티커] : 삭제\n"
-                       "/on : 시스템 켜기\n"
-                       "/off : 시스템 끄기")
+                       "/ping : 생존확인")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
-            @bot.message_handler(commands=['ping'])
-            def ping_cmd(m): bot.reply_to(m, "🏓 Pong! 정상 작동 중.")
-
-            # [복구] on/off 명령어
+            # [복구] on/off 명령어 (즉시 반영)
             @bot.message_handler(commands=['on'])
             def on_cmd(m):
                 c = load_config()
@@ -382,10 +404,7 @@ def start_background_worker():
             def add_cmd(m):
                 try:
                     t = m.text.split()[1].upper(); c = load_config()
-                    if t not in c['tickers']: 
-                        # [중요] 전체 옵션으로 추가
-                        c['tickers'][t] = DEFAULT_OPTS.copy()
-                        save_config(c); bot.reply_to(m, f"✅ {t} 추가됨")
+                    if t not in c['tickers']: c['tickers'][t] = DEFAULT_OPTS.copy(); save_config(c); bot.reply_to(m, f"✅ {t} 추가됨")
                 except: pass
 
             @bot.message_handler(commands=['del'])
@@ -395,13 +414,17 @@ def start_background_worker():
                     if t in c['tickers']: del c['tickers'][t]; save_config(c); bot.reply_to(m, f"🗑️ {t} 삭제됨")
                 except: pass
 
+            @bot.message_handler(commands=['ping'])
+            def ping_cmd(m): bot.reply_to(m, "🏓 Pong! 정상.")
+
             try:
                 bot.set_my_commands([
                     BotCommand("eco", "📅 경제지표"), BotCommand("earning", "💰 실적 발표"),
                     BotCommand("news", "📰 뉴스"), BotCommand("summary", "📊 요약"),
                     BotCommand("p", "💰 현재가"), BotCommand("sec", "🏛️ 공시"),
                     BotCommand("ping", "🏓 생존확인"), BotCommand("list", "📋 목록"),
-                    BotCommand("on", "🟢 가동"), BotCommand("off", "⛔ 정지")
+                    BotCommand("on", "🟢 가동"), BotCommand("off", "⛔ 정지"),
+                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제")
                 ])
             except: pass
 
@@ -437,38 +460,37 @@ def start_background_worker():
                     time.sleep(60)
 
             def analyze_ticker(ticker, settings, token, chat_id):
-                if not settings.get('감시_ON', True): return
+                # 구버전 키 방지 (마이그레이션된 키 사용)
+                if not settings.get('🟢 감시', True): return
                 try:
-                    if settings.get('뉴스') or settings.get('SEC'):
+                    # 뉴스
+                    if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         current_config = load_config()
-                        history = current_config.get('history', {"links": {}, "titles": {}})
-                        if ticker not in history['links']: history['links'][ticker] = []
-                        if ticker not in history['titles']: history['titles'][ticker] = []
+                        history = current_config.get('news_history', {})
+                        if ticker not in history: history[ticker] = []
                         
                         items = get_integrated_news(ticker, False)
                         updated = False
                         
                         for item in items:
-                            if item['link'] in history['links'][ticker]: continue
-                            if item['raw_title'] in history['titles'][ticker]: continue
+                            if item['link'] in history[ticker]: continue
                             
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
-                            should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
+                            should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
                             
                             if should_send:
                                 prefix = "🏛️" if is_sec else "📰"
                                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
                                 
-                                history['links'][ticker].append(item['link'])
-                                history['titles'][ticker].append(item['raw_title'])
-                                if len(history['links'][ticker]) > 20: history['links'][ticker].pop(0)
-                                if len(history['titles'][ticker]) > 20: history['titles'][ticker].pop(0)
+                                history[ticker].append(item['link'])
+                                if len(history[ticker]) > 30: history[ticker].pop(0)
                                 updated = True
                         if updated:
-                            current_config['history'] = history
+                            current_config['news_history'] = history
                             save_config(current_config)
 
-                    if settings.get('가격_3%'):
+                    # 가격 (3%)
+                    if settings.get('📈 급등락(3%)'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
                         if not h.empty:
@@ -479,7 +501,8 @@ def start_background_worker():
                                 if abs(pct - last) >= 1.0:
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
-                    if settings.get('RSI'):
+                    # RSI
+                    if settings.get('📉 RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
                             delta = h['Close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -535,7 +558,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V54)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V55)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
@@ -559,9 +582,12 @@ with t2:
 
     st.divider()
     c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
+    # [수정] ALL ON 버튼 로직 개선
     if c_all_1.button("✅ ALL ON", use_container_width=True):
-        for t in config['tickers']: config['tickers'][t] = DEFAULT_OPTS.copy()
+        for t in config['tickers']:
+            for k in config['tickers'][t]: config['tickers'][t][k] = True
         save_config(config); st.rerun()
+        
     if c_all_2.button("⛔ ALL OFF", use_container_width=True):
         for t in config['tickers']:
             for k in config['tickers'][t]: config['tickers'][t][k] = False
