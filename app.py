@@ -17,20 +17,21 @@ from deep_translator import GoogleTranslator
 # --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
+HISTORY_FILE = 'debrief_history.json' # [NEW] 뉴스 기록 저장용
 
-# [State] 캐시 초기화
-if 'news_cache' not in st.session_state: st.session_state['news_cache'] = {}
+# [State] 전역 변수 및 락 설정
+file_lock = threading.Lock() # 파일 쓰기 충돌 방지
+
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
 if 'eco_alert_cache' not in st.session_state: st.session_state['eco_alert_cache'] = set()
 
-news_cache = st.session_state['news_cache']
 price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
 eco_alert_cache = st.session_state['eco_alert_cache']
 
 # ---------------------------------------------------------
-# [0] 로그 기록
+# [0] 로그 및 히스토리 관리 (중복 방지 핵심)
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -39,6 +40,26 @@ def write_log(msg):
         with open(LOG_FILE, 'a', encoding='utf-8') as f:
             f.write(f"[{timestamp}] {msg}\n")
     except: pass
+
+# [NEW] 히스토리 로드
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except: pass
+    return {}
+
+# [NEW] 히스토리 저장 (스레드 안전)
+def save_history(data):
+    with file_lock:
+        try:
+            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+        except: pass
+
+# 전역 히스토리 변수 초기화
+news_history = load_history()
 
 # ---------------------------------------------------------
 # [1] 설정 로드/저장
@@ -143,29 +164,23 @@ def get_integrated_news(ticker, is_sec_search=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# [NEW] Finviz 스마트 스크래퍼 (테이블 자동 탐색)
+# [Finviz]
 def get_finviz_data(ticker):
     try:
         url = f"https://finviz.com/quote.ashx?t={ticker}"
-        # 1. Cloudscraper 시도
         try:
             scraper = cloudscraper.create_scraper()
             resp = scraper.get(url, timeout=5)
             text = resp.text
         except:
-            # 2. 일반 Requests 시도 (백업)
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
             resp = requests.get(url, headers=headers, timeout=5)
             text = resp.text
 
         dfs = pd.read_html(text)
         data = {}
-        
-        # 모든 테이블을 뒤져서 'P/E'나 'Market Cap'이 있는 테이블을 찾음
         for df in dfs:
-            # 데이터프레임을 문자열로 변환해서 키워드 검색
             if 'P/E' in df.to_string() or 'Market Cap' in df.to_string():
-                # 올바른 테이블 발견! Key-Value 파싱
                 if len(df.columns) > 1:
                     for i in range(0, len(df.columns), 2):
                         try:
@@ -178,18 +193,6 @@ def get_finviz_data(ticker):
     except Exception as e:
         write_log(f"Finviz Error ({ticker}): {e}")
         return {}
-
-# [NEW] Yahoo HTML 직접 파싱 (Fallback용)
-def get_yahoo_fallback(ticker):
-    try:
-        url = f"https://finance.yahoo.com/quote/{ticker}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(url, headers=headers, timeout=5)
-        # 단순 텍스트 검색으로 중요 데이터 추출 (가장 무식하지만 확실한 방법)
-        # 실제로는 정규식 등을 써야 하지만 여기선 데이터 유무만 체크
-        # (구현 복잡도상 생략하고 Finviz 강화에 집중)
-        return {}
-    except: return {}
 
 def get_economic_events():
     try:
@@ -237,16 +240,13 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V47 가동\n명령어 엔진이 교체되었습니다 (Finviz Pro).")
+            try: bot.send_message(chat_id, "🤖 DeBrief V48 가동\n뉴스 중복 방지 시스템이 활성화되었습니다.")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief V47*\n/earning, /summary, /eco, /news, /sec, /p, /list", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V48*\n/earning, /summary, /eco, /news, /sec, /p, /list", parse_mode='Markdown')
 
-            # ====================================================
-            # [Fix] /earning (Finviz -> Yfinance)
-            # ====================================================
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
@@ -255,18 +255,14 @@ def start_background_worker():
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    # 1. Finviz 시도
                     data = get_finviz_data(t)
                     msg = ""
-                    
                     if 'Earnings' in data and data['Earnings'] != '-':
                         e_date = data['Earnings']
-                        # BMO: Before Market Open, AMC: After Market Close
                         time_icon = "☀️ 장전" if "BMO" in e_date else "🌙 장후" if "AMC" in e_date else ""
                         clean_date = e_date.replace(' BMO','').replace(' AMC','')
                         msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{clean_date}` {time_icon}\nℹ️ 출처: Finviz"
                     
-                    # 2. Yfinance 시도 (Finviz 실패 시)
                     if not msg:
                         stock = yf.Ticker(t)
                         try:
@@ -281,13 +277,8 @@ def start_background_worker():
                     
                     if msg: bot.reply_to(m, msg, parse_mode='Markdown')
                     else: bot.reply_to(m, f"❌ {t}: 실적 발표 일정을 찾을 수 없습니다.")
+                except Exception as e: bot.reply_to(m, f"오류 발생: {e}")
 
-                except Exception as e:
-                    bot.reply_to(m, f"오류 발생: {e}")
-
-            # ====================================================
-            # [Fix] /summary (Finviz -> Yfinance Fast)
-            # ====================================================
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
@@ -296,49 +287,29 @@ def start_background_worker():
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    # 1. Finviz 데이터
                     d = get_finviz_data(t)
-                    
-                    # 2. Yfinance Fast Info (현재가용)
-                    try:
+                    try: 
                         fi = yf.Ticker(t).fast_info
                         curr_p = fi.last_price
-                    except: curr_p = None
+                        mkt_cap_y = fi.market_cap
+                    except: curr_p = None; mkt_cap_y = None
 
-                    # 데이터 우선순위 결정
-                    # 가격: 실시간성이 중요하므로 yfinance fast_info 우선
-                    # 지표: Finviz 우선
-                    
                     price = f"{curr_p:.2f}" if curr_p else d.get('Price', 'N/A')
                     pe = d.get('P/E', 'N/A')
                     pbr = d.get('P/B', 'N/A')
                     cap = d.get('Market Cap', 'N/A')
                     target = d.get('Target Price', 'N/A')
                     
-                    # Finviz가 막혀서 데이터가 다 N/A인 경우 Yfinance info 시도
-                    if pe == 'N/A' and cap == 'N/A':
-                        try:
-                            info = yf.Ticker(t).info
-                            if info:
-                                def s(k): return info.get(k, 'N/A')
-                                pe = s('trailingPE')
-                                pbr = s('priceToBook')
-                                target = s('targetMeanPrice')
-                                c_val = info.get('marketCap')
-                                if c_val: cap = f"${c_val/1e9:.2f}B"
-                        except: pass
+                    if cap == 'N/A' and mkt_cap_y:
+                        cap = f"${mkt_cap_y/1e9:.2f}B"
 
-                    msg = (f"📊 *{t} 재무 요약*\n"
-                           f"💰 현재가: `${price}`\n"
-                           f"🏢 시가총액: `{cap}`\n"
-                           f"📈 PER: `{pe}`\n"
-                           f"📚 PBR: `{pbr}`\n"
-                           f"🎯 목표주가: `${target}`")
-                    
+                    if pe == 'N/A' and cap == 'N/A' and curr_p is None:
+                         bot.reply_to(m, f"❌ {t}: 정보를 찾을 수 없습니다.")
+                         return
+
+                    msg = (f"📊 *{t} 재무 요약*\n💰 현재가: `${price}`\n🏢 시가총액: `{cap}`\n📈 PER: `{pe}`\n📚 PBR: `{pbr}`\n🎯 목표주가: `${target}`")
                     bot.reply_to(m, msg, parse_mode='Markdown')
-
-                except Exception as e:
-                    bot.reply_to(m, f"조회 실패: {e}")
+                except Exception as e: bot.reply_to(m, f"조회 실패: {e}")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
@@ -440,8 +411,10 @@ def start_background_worker():
                 while True:
                     try:
                         cfg = load_config()
+                        # 경제지표
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
+                            # 주간
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
@@ -450,6 +423,7 @@ def start_background_worker():
                                     for e in events:
                                         if e['impact'] == 'High': msg += f"\n🗓️ `{e['date']} {e['time']}`\n🔥 {e['event']}"; c+=1
                                     if c>0: bot.send_message(chat_id, msg, parse_mode='Markdown'); last_weekly_sent = now.strftime('%Y-%m-%d')
+                            # 데일리
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 today = datetime.now().strftime('%Y-%m-%d')
@@ -459,6 +433,7 @@ def start_background_worker():
                                     for e in todays: msg += f"\n⏰ {e['time']} : {e['event']} (예상:{e['forecast']})"
                                     bot.send_message(chat_id, msg, parse_mode='Markdown'); last_daily_sent = now.strftime('%Y-%m-%d')
 
+                        # 주식 감시
                         if cfg.get('system_active', True) and cfg['tickers']:
                             cur_token = cfg['telegram']['bot_token']; cur_chat = cfg['telegram']['chat_id']
                             with ThreadPoolExecutor(max_workers=5) as exe:
@@ -469,17 +444,35 @@ def start_background_worker():
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
+                    # [수정] 뉴스 중복 방지 (Persistent History 사용)
                     if settings.get('뉴스') or settings.get('SEC'):
-                        if ticker not in news_cache: news_cache[ticker] = set()
+                        # ticker별 리스트 초기화 확인
+                        if ticker not in news_history: news_history[ticker] = []
+                        
                         items = get_integrated_news(ticker, False)
+                        updated = False
+                        
                         for item in items:
-                            if any(x for x in news_cache[ticker] if x == item['link']): continue
+                            # 히스토리 파일에 있는 링크면 건너뜀
+                            if item['link'] in news_history[ticker]: continue
+                            
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
                             should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
+                            
                             if should_send:
                                 prefix = "🏛️" if is_sec else "📰"
                                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-                                news_cache[ticker].add(item['link'])
+                                
+                                # 히스토리에 추가
+                                news_history[ticker].append(item['link'])
+                                # 최근 30개만 유지 (용량 관리)
+                                if len(news_history[ticker]) > 30: news_history[ticker].pop(0)
+                                updated = True
+                        
+                        # 변경사항 있으면 파일 저장
+                        if updated: save_history(news_history)
+
+                    # 가격
                     if settings.get('가격_3%'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
@@ -491,6 +484,7 @@ def start_background_worker():
                                 if abs(pct - last) >= 1.0:
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
+                    # RSI
                     if settings.get('RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
@@ -545,7 +539,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V47)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V48)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
