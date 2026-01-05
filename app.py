@@ -8,7 +8,6 @@ import time
 import threading
 import telebot
 import xml.etree.ElementTree as ET
-import cloudscraper
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
@@ -18,7 +17,7 @@ from deep_translator import GoogleTranslator
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
 
-# [State] 캐시 초기화 (세션 스테이트 대신 전역 변수로 관리하여 재실행 시 유지력 강화)
+# [State] 캐시 초기화
 if 'news_cache' not in st.session_state: st.session_state['news_cache'] = {}
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
@@ -137,7 +136,6 @@ def get_integrated_news(ticker, is_sec_search=False):
                         date_str = dt.strftime('%m/%d %H:%M')
                     except: date_str = pubDate[:16]
                     
-                    # [수정] SEC도 번역 시도
                     try: title = translator.translate(title[:150]) 
                     except: pass
                     
@@ -149,12 +147,11 @@ def get_integrated_news(ticker, is_sec_search=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# 경제지표 (Cloudscraper)
+# 경제지표 (ForexFactory XML)
 def get_economic_events():
     try:
-        scraper = cloudscraper.create_scraper()
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        resp = scraper.get(url)
+        resp = requests.get(url, timeout=5)
         if resp.status_code != 200: return []
         
         root = ET.fromstring(resp.content)
@@ -205,13 +202,13 @@ def start_background_worker():
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V42 가동\n중복 알림 방지 및 SEC 번역이 적용되었습니다.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V43 가동\n명령어 기능이 정상화되었습니다.")
             except: pass
 
             # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V42 사용법*\n\n"
+                msg = ("🤖 *DeBrief V43 사용법*\n\n"
                        "📅 *경제/실적*\n"
                        "`/eco` : 이번 주 경제 일정\n"
                        "`/earning 티커` : 실적 발표일\n"
@@ -228,80 +225,115 @@ def start_background_worker():
                        "`/on`, `/off` : 전체 시스템")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
+            # [수정] 실적 발표 명령어 (2중 백업 구조 + 타임존 에러 해결)
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: 
-                        return bot.reply_to(m, "사용법: /earning [티커]")
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /earning TSLA")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
                     stock = yf.Ticker(t)
                     msg = None
 
+                    # 1. earnings_dates 시도
                     try:
                         dates = stock.earnings_dates
                         if dates is not None and not dates.empty:
-                            if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
-                            future = dates[dates.index >= pd.Timestamp.now()].sort_index()
+                            if dates.index.tz is not None: 
+                                dates.index = dates.index.tz_localize(None) # 타임존 제거
+                            
+                            now = pd.Timestamp.now()
+                            future = dates[dates.index >= now].sort_index()
+                            
                             if not future.empty:
                                 target = future.index[0]
                                 rec = future.loc[target]
                                 est = rec.get('EPS Estimate', 'N/A')
                                 if pd.isna(est): est = 'N/A'
-                                timing = "☀️ 장전" if target.hour < 12 else "🌙 장후" if target.hour > 0 else "시간 미정"
-                                msg = (f"📅 *{t} 실적 발표 (확정)*\n🗓️ `{target.strftime('%Y-%m-%d')}` ({timing})\n💰 예상 EPS: `{est}`")
+                                
+                                timing = "시간 미정"
+                                if target.hour > 0:
+                                    timing = "☀️ 장전" if target.hour < 12 else "🌙 장후"
+                                
+                                msg = (f"📅 *{t} 실적 발표 (확정)*\n"
+                                       f"🗓️ 날짜: `{target.strftime('%Y-%m-%d')}` ({timing})\n"
+                                       f"💰 예상 EPS: `{est}`")
                     except: pass
 
+                    # 2. calendar 시도 (백업)
                     if not msg:
                         try:
                             cal = stock.calendar
                             if isinstance(cal, pd.DataFrame) and not cal.empty:
                                 d_date = cal.iloc[0, 0]
-                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ `{d_date.strftime('%Y-%m-%d')}`"
+                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`"
                             elif isinstance(cal, dict) and 'Earnings Date' in cal:
                                 dates_list = cal['Earnings Date']
-                                if dates_list: msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ `{dates_list[0].strftime('%Y-%m-%d')}`"
+                                if dates_list:
+                                    msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{dates_list[0].strftime('%Y-%m-%d')}`"
                         except: pass
 
                     if msg: bot.reply_to(m, msg, parse_mode='Markdown')
-                    else: bot.reply_to(m, f"❌ {t}: 실적 발표 정보를 찾을 수 없습니다.")
-                except Exception as e: bot.reply_to(m, f"오류 발생: {e}")
+                    else: bot.reply_to(m, f"❌ {t}: 예정된 실적 정보를 찾을 수 없습니다.")
 
+                except Exception as e:
+                    bot.reply_to(m, f"오류 발생: {e}")
+
+            # [수정] 재무 요약 명령어 (fast_info 우선 사용 + 단위 포맷팅)
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary [티커]")
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary TSLA")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
                     stock = yf.Ticker(t)
+                    
+                    # fast_info (빠름)
                     try: curr = stock.fast_info.last_price
                     except: curr = None
+                    
+                    # info (상세)
                     try: i = stock.info
                     except: i = {}
 
-                    if not i and curr is None: return bot.reply_to(m, "❌ 정보를 찾을 수 없습니다.")
+                    if not i and curr is None:
+                        return bot.reply_to(m, "❌ 정보를 찾을 수 없습니다.")
 
-                    def get_val(key, default="N/A"): return i.get(key, default) if i else default
+                    # 값 안전하게 가져오기
+                    def get_val(key): return i.get(key) if i else None
+                    
                     price = curr if curr else get_val('currentPrice')
                     pe = get_val('trailingPE')
                     pbr = get_val('priceToBook')
                     cap = get_val('marketCap')
                     target = get_val('targetMeanPrice')
 
+                    # 포맷팅
                     def fmt(v, is_money=False):
-                        if isinstance(v, (int, float)): return f"${v:,.2f}" if is_money else f"{v:.2f}"
+                        if isinstance(v, (int, float)):
+                            return f"${v:,.2f}" if is_money else f"{v:.2f}"
                         return "N/A"
                     
+                    # 시총 조 단위 변환
                     cap_str = "N/A"
-                    if isinstance(cap, (int, float)): cap_str = f"${cap/1e9:.2f}B"
+                    if isinstance(cap, (int, float)):
+                        cap_str = f"${cap/1e9:.2f}B"
 
-                    msg = (f"📊 *{t} 재무 요약*\n💰 현재가: `{fmt(price, True)}`\n🏢 시총: `{cap_str}`\n📈 PER: `{fmt(pe)}`\n📚 PBR: `{fmt(pbr)}`\n🎯 목표가: `{fmt(target, True)}`")
+                    msg = (f"📊 *{t} 재무 요약*\n"
+                           f"💰 현재가: `{fmt(price, True)}`\n"
+                           f"🏢 시가총액: `{cap_str}`\n"
+                           f"📈 PER: `{fmt(pe)}`\n"
+                           f"📚 PBR: `{fmt(pbr)}`\n"
+                           f"🎯 목표주가: `{fmt(target, True)}`")
+                    
                     bot.reply_to(m, msg, parse_mode='Markdown')
-                except Exception as e: bot.reply_to(m, f"❌ 조회 실패: {e}")
+
+                except Exception as e:
+                    bot.reply_to(m, f"오류 발생: {e}")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
@@ -475,19 +507,17 @@ def start_background_worker():
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, is_sec_search=False)
                         for item in items:
-                            # [수정] 중복 체크 강화 (URL이 완벽히 같지 않아도 제목이 같으면 스킵)
-                            is_duplicate = False
-                            if item['link'] in news_cache[ticker]: is_duplicate = True
+                            # 중복 방지 (제목 기준)
+                            if any(x for x in news_cache[ticker] if x == item['link']): continue
                             
-                            if not is_duplicate:
-                                is_sec = "SEC" in item['title'] or "8-K" in item['title']
-                                should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
-                                
-                                if should_send:
-                                    prefix = "🏛️" if is_sec else "📰"
-                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                                data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-                                    news_cache[ticker].add(item['link'])
+                            is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                            should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
+                            
+                            if should_send:
+                                prefix = "🏛️" if is_sec else "📰"
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                                            data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+                                news_cache[ticker].add(item['link'])
                     
                     # 가격
                     if settings.get('가격_3%'):
@@ -569,7 +599,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V42)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V43)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
