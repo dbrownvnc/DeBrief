@@ -8,6 +8,7 @@ import time
 import threading
 import telebot
 import xml.etree.ElementTree as ET
+import cloudscraper
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
@@ -147,11 +148,12 @@ def get_integrated_news(ticker, is_sec_search=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# 경제지표 (ForexFactory XML)
+# 경제지표 (Cloudscraper)
 def get_economic_events():
     try:
+        scraper = cloudscraper.create_scraper()
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        resp = requests.get(url, timeout=5)
+        resp = scraper.get(url)
         if resp.status_code != 200: return []
         
         root = ET.fromstring(resp.content)
@@ -202,13 +204,13 @@ def start_background_worker():
             last_weekly_sent = None
             last_daily_sent = None
 
-            try: bot.send_message(chat_id, "🤖 DeBrief V43 가동\n명령어 기능이 정상화되었습니다.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V44 가동\n명령어 로직이 강화되었습니다.")
             except: pass
 
             # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V43 사용법*\n\n"
+                msg = ("🤖 *DeBrief V44 사용법*\n\n"
                        "📅 *경제/실적*\n"
                        "`/eco` : 이번 주 경제 일정\n"
                        "`/earning 티커` : 실적 발표일\n"
@@ -225,32 +227,39 @@ def start_background_worker():
                        "`/on`, `/off` : 전체 시스템")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
-            # [수정] 실적 발표 명령어 (2중 백업 구조 + 타임존 에러 해결)
+            # ====================================================
+            # [Fix 1] /earning 명령어 강력 수정
+            # ====================================================
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "사용법: /earning TSLA")
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: /earning [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
                     stock = yf.Ticker(t)
                     msg = None
 
-                    # 1. earnings_dates 시도
+                    # 1. earnings_dates (데이터프레임) 방식 시도
                     try:
                         dates = stock.earnings_dates
                         if dates is not None and not dates.empty:
-                            if dates.index.tz is not None: 
-                                dates.index = dates.index.tz_localize(None) # 타임존 제거
+                            # 타임존 충돌 방지 (중요!)
+                            if dates.index.tz is not None:
+                                dates.index = dates.index.tz_localize(None)
                             
                             now = pd.Timestamp.now()
+                            # 미래 날짜만 필터링
                             future = dates[dates.index >= now].sort_index()
                             
                             if not future.empty:
-                                target = future.index[0]
-                                rec = future.loc[target]
-                                est = rec.get('EPS Estimate', 'N/A')
+                                target = future.index[0] # 가장 가까운 미래
+                                row = future.loc[target]
+                                
+                                # EPS 값 추출 (Series일 경우 처리)
+                                est = row.get('EPS Estimate', 'N/A')
+                                if isinstance(est, pd.Series): est = est.iloc[0]
                                 if pd.isna(est): est = 'N/A'
                                 
                                 timing = "시간 미정"
@@ -260,80 +269,101 @@ def start_background_worker():
                                 msg = (f"📅 *{t} 실적 발표 (확정)*\n"
                                        f"🗓️ 날짜: `{target.strftime('%Y-%m-%d')}` ({timing})\n"
                                        f"💰 예상 EPS: `{est}`")
-                    except: pass
+                    except Exception as e:
+                        print(f"Earnings Dates Error: {e}")
 
-                    # 2. calendar 시도 (백업)
+                    # 2. Calendar (딕셔너리/리스트) 방식 시도 - 1번 실패 시 백업
                     if not msg:
                         try:
                             cal = stock.calendar
-                            if isinstance(cal, pd.DataFrame) and not cal.empty:
-                                d_date = cal.iloc[0, 0]
-                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`"
-                            elif isinstance(cal, dict) and 'Earnings Date' in cal:
+                            # cal이 딕셔너리이고 'Earnings Date' 키가 있는 경우
+                            if isinstance(cal, dict) and 'Earnings Date' in cal:
                                 dates_list = cal['Earnings Date']
                                 if dates_list:
-                                    msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{dates_list[0].strftime('%Y-%m-%d')}`"
+                                    d_date = dates_list[0]
+                                    msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`"
+                            # cal이 데이터프레임인 경우
+                            elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                                d_date = cal.iloc[0, 0]
+                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`"
                         except: pass
 
-                    if msg: bot.reply_to(m, msg, parse_mode='Markdown')
-                    else: bot.reply_to(m, f"❌ {t}: 예정된 실적 정보를 찾을 수 없습니다.")
+                    # 3. Info 방식 시도 - 최후의 수단
+                    if not msg:
+                        try:
+                            info = stock.info
+                            if 'earningsTimestamp' in info:
+                                ts = info['earningsTimestamp']
+                                d = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{d}`"
+                        except: pass
+
+                    if msg:
+                        bot.reply_to(m, msg, parse_mode='Markdown')
+                    else:
+                        bot.reply_to(m, f"❌ {t}: 예정된 실적 발표 정보를 찾을 수 없습니다.\n(ETF나 리츠는 정보가 없을 수 있습니다)")
 
                 except Exception as e:
-                    bot.reply_to(m, f"오류 발생: {e}")
+                    bot.reply_to(m, f"❌ 오류 발생: {e}")
 
-            # [수정] 재무 요약 명령어 (fast_info 우선 사용 + 단위 포맷팅)
+            # ====================================================
+            # [Fix 2] /summary 명령어 강력 수정
+            # ====================================================
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary TSLA")
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: /summary [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
                     stock = yf.Ticker(t)
                     
-                    # fast_info (빠름)
-                    try: curr = stock.fast_info.last_price
-                    except: curr = None
-                    
-                    # info (상세)
-                    try: i = stock.info
-                    except: i = {}
+                    # 1. 가격 정보 (fast_info 사용 - 가장 빠르고 확실함)
+                    try:
+                        curr_price = stock.fast_info.last_price
+                    except:
+                        curr_price = None
 
-                    if not i and curr is None:
-                        return bot.reply_to(m, "❌ 정보를 찾을 수 없습니다.")
+                    # 2. 상세 정보 (info 사용 - 느리거나 막힐 수 있음)
+                    try:
+                        info = stock.info
+                    except:
+                        info = {} # 실패해도 빈 딕셔너리로 처리하여 가격이라도 보여줌
 
-                    # 값 안전하게 가져오기
-                    def get_val(key): return i.get(key) if i else None
-                    
-                    price = curr if curr else get_val('currentPrice')
-                    pe = get_val('trailingPE')
-                    pbr = get_val('priceToBook')
-                    cap = get_val('marketCap')
-                    target = get_val('targetMeanPrice')
+                    if curr_price is None and not info:
+                        return bot.reply_to(m, "❌ 정보를 가져올 수 없습니다. 티커를 확인해주세요.")
 
-                    # 포맷팅
-                    def fmt(v, is_money=False):
-                        if isinstance(v, (int, float)):
-                            return f"${v:,.2f}" if is_money else f"{v:.2f}"
+                    # 데이터 안전 추출 함수
+                    def get_safe(key):
+                        return info.get(key) if info else None
+
+                    # 포맷팅 함수
+                    def fmt(val, is_currency=False):
+                        if isinstance(val, (int, float)):
+                            return f"${val:,.2f}" if is_currency else f"{val:,.2f}"
                         return "N/A"
-                    
-                    # 시총 조 단위 변환
+
+                    # 시가총액 조 단위 변환
+                    mkt_cap = get_safe('marketCap')
                     cap_str = "N/A"
-                    if isinstance(cap, (int, float)):
-                        cap_str = f"${cap/1e9:.2f}B"
+                    if isinstance(mkt_cap, (int, float)):
+                        cap_str = f"${mkt_cap/1e9:.2f}B" # Billions
+
+                    # 가격 결정 (fast_info 우선, 없으면 info)
+                    final_price = curr_price if curr_price else get_safe('currentPrice')
 
                     msg = (f"📊 *{t} 재무 요약*\n"
-                           f"💰 현재가: `{fmt(price, True)}`\n"
+                           f"💰 현재가: `{fmt(final_price, True)}`\n"
                            f"🏢 시가총액: `{cap_str}`\n"
-                           f"📈 PER: `{fmt(pe)}`\n"
-                           f"📚 PBR: `{fmt(pbr)}`\n"
-                           f"🎯 목표주가: `{fmt(target, True)}`")
+                           f"📈 PER: `{fmt(get_safe('trailingPE'))}`\n"
+                           f"📚 PBR: `{fmt(get_safe('priceToBook'))}`\n"
+                           f"🎯 목표주가: `{fmt(get_safe('targetMeanPrice'), True)}`")
                     
                     bot.reply_to(m, msg, parse_mode='Markdown')
 
                 except Exception as e:
-                    bot.reply_to(m, f"오류 발생: {e}")
+                    bot.reply_to(m, f"❌ 조회 중 오류가 발생했습니다: {e}")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
@@ -507,7 +537,6 @@ def start_background_worker():
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, is_sec_search=False)
                         for item in items:
-                            # 중복 방지 (제목 기준)
                             if any(x for x in news_cache[ticker] if x == item['link']): continue
                             
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
@@ -599,7 +628,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V43)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V44)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
