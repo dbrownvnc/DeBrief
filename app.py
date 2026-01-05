@@ -105,7 +105,7 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진 (Finviz Scraper 추가)
+# [2] 데이터 엔진
 # ---------------------------------------------------------
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -133,6 +133,7 @@ def get_integrated_news(ticker, is_sec_search=False):
                         dt = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
                         date_str = dt.strftime('%m/%d %H:%M')
                     except: date_str = pubDate[:16]
+                    
                     try: title = translator.translate(title[:150]) 
                     except: pass
                     prefix = "🏛️" if is_sec_search else "📰"
@@ -142,29 +143,53 @@ def get_integrated_news(ticker, is_sec_search=False):
     for url in search_urls: fetch(url)
     return collected_items
 
-# [NEW] Finviz 데이터 스크래퍼 (재무 정보 및 실적일 확보용)
+# [NEW] Finviz 스마트 스크래퍼 (테이블 자동 탐색)
 def get_finviz_data(ticker):
     try:
         url = f"https://finviz.com/quote.ashx?t={ticker}"
-        scraper = cloudscraper.create_scraper() # 403 우회
-        resp = scraper.get(url, timeout=5)
-        if resp.status_code != 200: return {}
+        # 1. Cloudscraper 시도
+        try:
+            scraper = cloudscraper.create_scraper()
+            resp = scraper.get(url, timeout=5)
+            text = resp.text
+        except:
+            # 2. 일반 Requests 시도 (백업)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+            resp = requests.get(url, headers=headers, timeout=5)
+            text = resp.text
 
-        dfs = pd.read_html(resp.text)
-        # 보통 5번째 테이블부터가 주요 정보
+        dfs = pd.read_html(text)
         data = {}
+        
+        # 모든 테이블을 뒤져서 'P/E'나 'Market Cap'이 있는 테이블을 찾음
         for df in dfs:
-            if len(df) > 0 and len(df.columns) > 1:
-                # 테이블을 순회하며 Key-Value 추출
-                for i in range(0, len(df.columns), 2):
-                    keys = df.iloc[:, i]
-                    values = df.iloc[:, i+1]
-                    for k, v in zip(keys, values):
-                        data[str(k)] = str(v)
+            # 데이터프레임을 문자열로 변환해서 키워드 검색
+            if 'P/E' in df.to_string() or 'Market Cap' in df.to_string():
+                # 올바른 테이블 발견! Key-Value 파싱
+                if len(df.columns) > 1:
+                    for i in range(0, len(df.columns), 2):
+                        try:
+                            keys = df.iloc[:, i]
+                            values = df.iloc[:, i+1]
+                            for k, v in zip(keys, values):
+                                data[str(k)] = str(v)
+                        except: pass
         return data
     except Exception as e:
         write_log(f"Finviz Error ({ticker}): {e}")
         return {}
+
+# [NEW] Yahoo HTML 직접 파싱 (Fallback용)
+def get_yahoo_fallback(ticker):
+    try:
+        url = f"https://finance.yahoo.com/quote/{ticker}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=5)
+        # 단순 텍스트 검색으로 중요 데이터 추출 (가장 무식하지만 확실한 방법)
+        # 실제로는 정규식 등을 써야 하지만 여기선 데이터 유무만 체크
+        # (구현 복잡도상 생략하고 Finviz 강화에 집중)
+        return {}
+    except: return {}
 
 def get_economic_events():
     try:
@@ -193,9 +218,7 @@ def get_economic_events():
             })
         events.sort(key=lambda x: (x['date'], x['time']))
         return events
-    except Exception as e:
-        write_log(f"Eco Error: {e}")
-        return []
+    except: return []
 
 # ---------------------------------------------------------
 # [3] 백그라운드 봇
@@ -214,106 +237,108 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V46 가동\nFinviz 엔진이 탑재되었습니다.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V47 가동\n명령어 엔진이 교체되었습니다 (Finviz Pro).")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V46*\n"
-                       "/earning [티커] : 실적발표 (Finviz)\n"
-                       "/summary [티커] : 재무요약 (Finviz)\n"
-                       "/eco : 경제지표\n"
-                       "/news [티커] : 뉴스\n"
-                       "/sec [티커] : 공시\n"
-                       "/p [티커] : 현재가\n"
-                       "/on, /off, /list")
-                bot.reply_to(m, msg, parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V47*\n/earning, /summary, /eco, /news, /sec, /p, /list", parse_mode='Markdown')
 
             # ====================================================
-            # [Fix 1] /earning (Finviz 기반 확실한 날짜)
+            # [Fix] /earning (Finviz -> Yfinance)
             # ====================================================
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "사용법: /earning [티커]")
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: /earning [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    # 1. Finviz 데이터 우선 조회
+                    # 1. Finviz 시도
                     data = get_finviz_data(t)
-                    earning_date = data.get('Earnings', '-')
-                    
                     msg = ""
-                    if earning_date != '-':
-                        # 날짜 포맷 예: Jan 24 AMC (장마감후), BMO (장시작전)
-                        time_desc = ""
-                        if "AMC" in earning_date: time_desc = "🌙 장 마감 후"
-                        elif "BMO" in earning_date: time_desc = "☀️ 장 시작 전"
-                        
-                        clean_date = earning_date.replace(' AMC','').replace(' BMO','')
-                        msg = (f"📅 *{t} 실적 발표*\n"
-                               f"🗓️ 일시: `{clean_date}` {time_desc}\n"
-                               f"ℹ️ 출처: Finviz")
                     
-                    # 2. Finviz 실패 시 yfinance 백업
+                    if 'Earnings' in data and data['Earnings'] != '-':
+                        e_date = data['Earnings']
+                        # BMO: Before Market Open, AMC: After Market Close
+                        time_icon = "☀️ 장전" if "BMO" in e_date else "🌙 장후" if "AMC" in e_date else ""
+                        clean_date = e_date.replace(' BMO','').replace(' AMC','')
+                        msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{clean_date}` {time_icon}\nℹ️ 출처: Finviz"
+                    
+                    # 2. Yfinance 시도 (Finviz 실패 시)
                     if not msg:
                         stock = yf.Ticker(t)
-                        dates = stock.earnings_dates
-                        if dates is not None and not dates.empty:
-                            if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
-                            target = dates.index[0]
-                            msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{target.strftime('%Y-%m-%d')}`\n(Yfinance 데이터)"
+                        try:
+                            dates = stock.earnings_dates
+                            if dates is not None and not dates.empty:
+                                if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
+                                future = dates[dates.index >= pd.Timestamp.now()].sort_index()
+                                if not future.empty:
+                                    target = future.index[0]
+                                    msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{target.strftime('%Y-%m-%d')}`\n(Yfinance 데이터)"
+                        except: pass
                     
                     if msg: bot.reply_to(m, msg, parse_mode='Markdown')
-                    else: bot.reply_to(m, f"❌ {t}: 예정된 실적 정보를 찾을 수 없습니다.")
+                    else: bot.reply_to(m, f"❌ {t}: 실적 발표 일정을 찾을 수 없습니다.")
 
                 except Exception as e:
-                    bot.reply_to(m, f"❌ 오류 발생: {e}")
+                    bot.reply_to(m, f"오류 발생: {e}")
 
             # ====================================================
-            # [Fix 2] /summary (Finviz 기반 확실한 데이터)
+            # [Fix] /summary (Finviz -> Yfinance Fast)
             # ====================================================
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary [티커]")
+                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: /summary [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    # 1. Finviz 데이터 가져오기
+                    # 1. Finviz 데이터
                     d = get_finviz_data(t)
                     
-                    if not d:
-                        # 데이터 없으면 yfinance fast_info로 현재가만이라도
-                        try:
-                            price = yf.Ticker(t).fast_info.last_price
-                            bot.reply_to(m, f"📊 *{t}*\n💰 현재가: `${price:.2f}`\n(상세 정보 없음)", parse_mode='Markdown')
-                        except:
-                            bot.reply_to(m, f"❌ {t}: 정보를 찾을 수 없습니다.")
-                        return
+                    # 2. Yfinance Fast Info (현재가용)
+                    try:
+                        fi = yf.Ticker(t).fast_info
+                        curr_p = fi.last_price
+                    except: curr_p = None
 
-                    # 데이터 매핑 (Finviz 키 값)
-                    price = d.get('Price', 'N/A')
-                    pe = d.get('P/E', 'N/A')
-                    f_pe = d.get('Forward P/E', 'N/A')
-                    pbr = d.get('P/B', 'N/A')
-                    target = d.get('Target Price', 'N/A')
-                    mkt_cap = d.get('Market Cap', 'N/A')
-                    perf_w = d.get('Perf Week', 'N/A')
+                    # 데이터 우선순위 결정
+                    # 가격: 실시간성이 중요하므로 yfinance fast_info 우선
+                    # 지표: Finviz 우선
                     
-                    msg = (f"📊 *{t} 재무 요약 (Finviz)*\n"
-                           f"💰 현재가: `${price}` ({perf_w})\n"
-                           f"🏢 시가총액: `{mkt_cap}`\n"
-                           f"📈 P/E: `{pe}` (Fwd: `{f_pe}`)\n"
-                           f"📚 P/B: `{pbr}`\n"
+                    price = f"{curr_p:.2f}" if curr_p else d.get('Price', 'N/A')
+                    pe = d.get('P/E', 'N/A')
+                    pbr = d.get('P/B', 'N/A')
+                    cap = d.get('Market Cap', 'N/A')
+                    target = d.get('Target Price', 'N/A')
+                    
+                    # Finviz가 막혀서 데이터가 다 N/A인 경우 Yfinance info 시도
+                    if pe == 'N/A' and cap == 'N/A':
+                        try:
+                            info = yf.Ticker(t).info
+                            if info:
+                                def s(k): return info.get(k, 'N/A')
+                                pe = s('trailingPE')
+                                pbr = s('priceToBook')
+                                target = s('targetMeanPrice')
+                                c_val = info.get('marketCap')
+                                if c_val: cap = f"${c_val/1e9:.2f}B"
+                        except: pass
+
+                    msg = (f"📊 *{t} 재무 요약*\n"
+                           f"💰 현재가: `${price}`\n"
+                           f"🏢 시가총액: `{cap}`\n"
+                           f"📈 PER: `{pe}`\n"
+                           f"📚 PBR: `{pbr}`\n"
                            f"🎯 목표주가: `${target}`")
                     
                     bot.reply_to(m, msg, parse_mode='Markdown')
 
                 except Exception as e:
-                    bot.reply_to(m, f"❌ 오류 발생: {e}")
+                    bot.reply_to(m, f"조회 실패: {e}")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
@@ -359,8 +384,7 @@ def start_background_worker():
 
             @bot.message_handler(commands=['list'])
             def list_cmd(m):
-                try:
-                    c = load_config(); bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
+                try: c = load_config(); bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
                 except: pass
 
             @bot.message_handler(commands=['news'])
@@ -416,10 +440,8 @@ def start_background_worker():
                 while True:
                     try:
                         cfg = load_config()
-                        # 경제지표
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
-                            # 주간
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
@@ -428,7 +450,6 @@ def start_background_worker():
                                     for e in events:
                                         if e['impact'] == 'High': msg += f"\n🗓️ `{e['date']} {e['time']}`\n🔥 {e['event']}"; c+=1
                                     if c>0: bot.send_message(chat_id, msg, parse_mode='Markdown'); last_weekly_sent = now.strftime('%Y-%m-%d')
-                            # 데일리
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 today = datetime.now().strftime('%Y-%m-%d')
@@ -438,7 +459,6 @@ def start_background_worker():
                                     for e in todays: msg += f"\n⏰ {e['time']} : {e['event']} (예상:{e['forecast']})"
                                     bot.send_message(chat_id, msg, parse_mode='Markdown'); last_daily_sent = now.strftime('%Y-%m-%d')
 
-                        # 주식 감시
                         if cfg.get('system_active', True) and cfg['tickers']:
                             cur_token = cfg['telegram']['bot_token']; cur_chat = cfg['telegram']['chat_id']
                             with ThreadPoolExecutor(max_workers=5) as exe:
@@ -449,7 +469,6 @@ def start_background_worker():
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('감시_ON', True): return
                 try:
-                    # 뉴스
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
                         items = get_integrated_news(ticker, False)
@@ -461,7 +480,6 @@ def start_background_worker():
                                 prefix = "🏛️" if is_sec else "📰"
                                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
                                 news_cache[ticker].add(item['link'])
-                    # 가격
                     if settings.get('가격_3%'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
@@ -473,7 +491,6 @@ def start_background_worker():
                                 if abs(pct - last) >= 1.0:
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
-                    # RSI
                     if settings.get('RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
@@ -528,7 +545,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V46)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V47)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
