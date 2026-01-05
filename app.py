@@ -105,11 +105,10 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진
+# [2] 데이터 엔진 (Finviz Scraper 추가)
 # ---------------------------------------------------------
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
-    
     if is_sec_search:
         search_urls = [f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en"]
     else:
@@ -128,46 +127,60 @@ def get_integrated_news(ticker, is_sec_search=False):
                     title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
                     pubDate = item.find('pubDate').text
-                    
                     if link in seen_links: continue
                     seen_links.add(link)
-                    
                     try:
                         dt = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
                         date_str = dt.strftime('%m/%d %H:%M')
                     except: date_str = pubDate[:16]
-                    
                     try: title = translator.translate(title[:150]) 
                     except: pass
-                    
                     prefix = "🏛️" if is_sec_search else "📰"
                     collected_items.append({'title': f"{prefix} {title}", 'link': link, 'date': date_str})
                 except: continue
         except: pass
-
     for url in search_urls: fetch(url)
     return collected_items
 
-# 경제지표 (Cloudscraper)
+# [NEW] Finviz 데이터 스크래퍼 (재무 정보 및 실적일 확보용)
+def get_finviz_data(ticker):
+    try:
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        scraper = cloudscraper.create_scraper() # 403 우회
+        resp = scraper.get(url, timeout=5)
+        if resp.status_code != 200: return {}
+
+        dfs = pd.read_html(resp.text)
+        # 보통 5번째 테이블부터가 주요 정보
+        data = {}
+        for df in dfs:
+            if len(df) > 0 and len(df.columns) > 1:
+                # 테이블을 순회하며 Key-Value 추출
+                for i in range(0, len(df.columns), 2):
+                    keys = df.iloc[:, i]
+                    values = df.iloc[:, i+1]
+                    for k, v in zip(keys, values):
+                        data[str(k)] = str(v)
+        return data
+    except Exception as e:
+        write_log(f"Finviz Error ({ticker}): {e}")
+        return {}
+
 def get_economic_events():
     try:
         scraper = cloudscraper.create_scraper()
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
         resp = scraper.get(url)
         if resp.status_code != 200: return []
-        
         root = ET.fromstring(resp.content)
         events = []
         translator = GoogleTranslator(source='auto', target='ko')
-        
         for event in root.findall('event'):
             if event.find('country').text != 'USD': continue
             if event.find('impact').text not in ['High', 'Medium']: continue
-            
             title = event.find('title').text
             try: title = translator.translate(title)
             except: pass
-            
             events.append({
                 'date': event.find('date').text,
                 'time': event.find('time').text,
@@ -195,160 +208,112 @@ def start_background_worker():
         cfg = load_config()
         token = cfg['telegram']['bot_token']
         chat_id = cfg['telegram']['chat_id']
-        
         if not token: return
         
         try:
             bot = telebot.TeleBot(token)
-            
             last_weekly_sent = None
             last_daily_sent = None
-
-            try: bot.send_message(chat_id, "🤖 DeBrief V45 가동\n명령어 안전성 패치 완료.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V46 가동\nFinviz 엔진이 탑재되었습니다.")
             except: pass
 
-            # --- 명령어 ---
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V45 사용법*\n\n"
-                       "📅 *경제/실적*\n"
-                       "`/eco` : 이번 주 경제 일정\n"
-                       "`/earning 티커` : 실적 발표일\n"
-                       "`/summary 티커` : 재무 요약 (강화됨)\n"
-                       "`/vix` : 공포 지수\n\n"
-                       "📊 *조회*\n"
-                       "`/p 티커` : 현재가\n"
-                       "`/news 티커` : 뉴스 검색\n"
-                       "`/sec 티커` : 공시 조회\n\n"
-                       "⚙️ *관리*\n"
-                       "`/list` : 감시 목록\n"
-                       "`/add 티커` : 추가\n"
-                       "`/del 티커` : 삭제\n"
-                       "`/on`, `/off` : 전체 시스템")
+                msg = ("🤖 *DeBrief V46*\n"
+                       "/earning [티커] : 실적발표 (Finviz)\n"
+                       "/summary [티커] : 재무요약 (Finviz)\n"
+                       "/eco : 경제지표\n"
+                       "/news [티커] : 뉴스\n"
+                       "/sec [티커] : 공시\n"
+                       "/p [티커] : 현재가\n"
+                       "/on, /off, /list")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
             # ====================================================
-            # [Fix 1] /earning 명령어 (초강력 예외처리)
+            # [Fix 1] /earning (Finviz 기반 확실한 날짜)
             # ====================================================
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: /earning [티커]")
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /earning [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    stock = yf.Ticker(t)
-                    msg = None
-
-                    # 1. earnings_dates 사용
-                    try:
+                    # 1. Finviz 데이터 우선 조회
+                    data = get_finviz_data(t)
+                    earning_date = data.get('Earnings', '-')
+                    
+                    msg = ""
+                    if earning_date != '-':
+                        # 날짜 포맷 예: Jan 24 AMC (장마감후), BMO (장시작전)
+                        time_desc = ""
+                        if "AMC" in earning_date: time_desc = "🌙 장 마감 후"
+                        elif "BMO" in earning_date: time_desc = "☀️ 장 시작 전"
+                        
+                        clean_date = earning_date.replace(' AMC','').replace(' BMO','')
+                        msg = (f"📅 *{t} 실적 발표*\n"
+                               f"🗓️ 일시: `{clean_date}` {time_desc}\n"
+                               f"ℹ️ 출처: Finviz")
+                    
+                    # 2. Finviz 실패 시 yfinance 백업
+                    if not msg:
+                        stock = yf.Ticker(t)
                         dates = stock.earnings_dates
                         if dates is not None and not dates.empty:
                             if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
-                            future = dates[dates.index >= pd.Timestamp.now()].sort_index()
-                            
-                            if not future.empty:
-                                target = future.index[0]
-                                row = future.loc[target]
-                                
-                                est = "N/A"
-                                if 'EPS Estimate' in row:
-                                    val = row['EPS Estimate']
-                                    if pd.notna(val): est = f"{val:.2f}"
-                                
-                                timing = "시간 미정"
-                                if target.hour > 0:
-                                    timing = "☀️ 장전" if target.hour < 12 else "🌙 장후"
-                                
-                                msg = (f"📅 *{t} 실적 발표 (확정)*\n"
-                                       f"🗓️ 날짜: `{target.strftime('%Y-%m-%d')}` ({timing})\n"
-                                       f"💰 예상 EPS: `{est}`")
-                    except Exception as e:
-                        write_log(f"Earning Dates Error ({t}): {e}")
-
-                    # 2. calendar (백업)
-                    if not msg:
-                        try:
-                            cal = stock.calendar
-                            if isinstance(cal, pd.DataFrame) and not cal.empty:
-                                d_date = cal.iloc[0, 0]
-                                msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{d_date.strftime('%Y-%m-%d')}`"
-                            elif isinstance(cal, dict) and 'Earnings Date' in cal:
-                                dates_list = cal['Earnings Date']
-                                if dates_list:
-                                    msg = f"📅 *{t} 실적 발표 (예상)*\n🗓️ 날짜: `{dates_list[0].strftime('%Y-%m-%d')}`"
-                        except: pass
-
+                            target = dates.index[0]
+                            msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{target.strftime('%Y-%m-%d')}`\n(Yfinance 데이터)"
+                    
                     if msg: bot.reply_to(m, msg, parse_mode='Markdown')
-                    else: bot.reply_to(m, f"❌ {t}: 예정된 실적 정보를 찾을 수 없습니다.\n(ETF나 리츠는 정보가 없을 수 있습니다)")
+                    else: bot.reply_to(m, f"❌ {t}: 예정된 실적 정보를 찾을 수 없습니다.")
 
                 except Exception as e:
                     bot.reply_to(m, f"❌ 오류 발생: {e}")
 
             # ====================================================
-            # [Fix 2] /summary 명령어 (fast_info 기반 + info 보조)
+            # [Fix 2] /summary (Finviz 기반 확실한 데이터)
             # ====================================================
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "⚠️ 사용법: /summary [티커]")
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    stock = yf.Ticker(t)
+                    # 1. Finviz 데이터 가져오기
+                    d = get_finviz_data(t)
                     
-                    # [Step 1] Fast Info (무조건 성공해야 함)
-                    try:
-                        fi = stock.fast_info
-                        curr_price = fi.last_price
-                        prev_close = fi.previous_close
-                        mkt_cap = fi.market_cap
-                        
-                        if curr_price is None: raise ValueError("No Price")
-                        
-                        # 등락률 계산
-                        pct_change = ((curr_price - prev_close) / prev_close) * 100
-                    except:
-                        bot.reply_to(m, f"❌ '{t}'의 기본 정보를 가져올 수 없습니다. 티커를 확인해주세요.")
+                    if not d:
+                        # 데이터 없으면 yfinance fast_info로 현재가만이라도
+                        try:
+                            price = yf.Ticker(t).fast_info.last_price
+                            bot.reply_to(m, f"📊 *{t}*\n💰 현재가: `${price:.2f}`\n(상세 정보 없음)", parse_mode='Markdown')
+                        except:
+                            bot.reply_to(m, f"❌ {t}: 정보를 찾을 수 없습니다.")
                         return
 
-                    # [Step 2] Info (실패 가능성 높음 -> 예외 처리)
-                    try:
-                        info = stock.info
-                        if info is None: info = {}
-                    except:
-                        info = {} # 실패하면 빈 dict
-
-                    # 데이터 포맷팅
-                    def fmt(v, is_usd=False):
-                        if isinstance(v, (int, float)):
-                            return f"${v:,.2f}" if is_usd else f"{v:.2f}"
-                        return "N/A"
-
-                    # 시총 조 단위 ($B)
-                    cap_str = "N/A"
-                    if mkt_cap: cap_str = f"${mkt_cap/1e9:.2f}B"
-
-                    # Info에서 가져올 데이터 (없으면 N/A)
-                    pe = fmt(info.get('trailingPE'))
-                    pbr = fmt(info.get('priceToBook'))
-                    target = fmt(info.get('targetMeanPrice'), True)
+                    # 데이터 매핑 (Finviz 키 값)
+                    price = d.get('Price', 'N/A')
+                    pe = d.get('P/E', 'N/A')
+                    f_pe = d.get('Forward P/E', 'N/A')
+                    pbr = d.get('P/B', 'N/A')
+                    target = d.get('Target Price', 'N/A')
+                    mkt_cap = d.get('Market Cap', 'N/A')
+                    perf_w = d.get('Perf Week', 'N/A')
                     
-                    # 최종 메시지 조합
-                    sign = "+" if pct_change >= 0 else ""
-                    msg = (f"📊 *{t} 요약 정보*\n"
-                           f"💰 현재가: `{fmt(curr_price, True)}` ({sign}{pct_change:.2f}%)\n"
-                           f"🏢 시가총액: `{cap_str}`\n"
-                           f"📈 PER: `{pe}`\n"
-                           f"📚 PBR: `{pbr}`\n"
-                           f"🎯 목표주가: `{target}`")
+                    msg = (f"📊 *{t} 재무 요약 (Finviz)*\n"
+                           f"💰 현재가: `${price}` ({perf_w})\n"
+                           f"🏢 시가총액: `{mkt_cap}`\n"
+                           f"📈 P/E: `{pe}` (Fwd: `{f_pe}`)\n"
+                           f"📚 P/B: `{pbr}`\n"
+                           f"🎯 목표주가: `${target}`")
                     
                     bot.reply_to(m, msg, parse_mode='Markdown')
 
                 except Exception as e:
-                    bot.reply_to(m, f"❌ 처리 중 오류 발생: {e}")
+                    bot.reply_to(m, f"❌ 오류 발생: {e}")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
@@ -356,17 +321,16 @@ def start_background_worker():
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
                     if not events: return bot.reply_to(m, "❌ 일정 없음")
-                    
                     msg = "📅 *주요 경제 일정 (USD)*\n────────────────"
-                    count = 0
+                    c=0
                     for e in events:
                         icon = "🔥" if e['impact'] == 'High' else "🔸"
-                        fcst = f"(예상: {e['forecast']})" if e['forecast'] else ""
+                        fcst = f"(예상:{e['forecast']})" if e['forecast'] else ""
                         msg += f"\n{icon} `{e['date']} {e['time']}`\n*{e['event']}* {fcst}\n"
-                        count += 1
-                        if count >= 15: break
+                        c+=1
+                        if c>=15: break
                     bot.reply_to(m, msg, parse_mode='Markdown')
-                except: bot.reply_to(m, "오류 발생")
+                except: pass
 
             @bot.message_handler(commands=['vix'])
             def vix_cmd(m):
@@ -396,15 +360,14 @@ def start_background_worker():
             @bot.message_handler(commands=['list'])
             def list_cmd(m):
                 try:
-                    c = load_config()
-                    bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
+                    c = load_config(); bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
                 except: pass
 
             @bot.message_handler(commands=['news'])
             def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    items = get_integrated_news(t, is_sec_search=False)
+                    items = get_integrated_news(t, False)
                     if not items: return bot.reply_to(m, "뉴스 없음")
                     msg = [f"📰 *{t} News*"]
                     for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
@@ -415,7 +378,7 @@ def start_background_worker():
             def sec_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    items = get_integrated_news(t, is_sec_search=True)
+                    items = get_integrated_news(t, True)
                     if items:
                         msg = [f"🏛️ *{t} SEC*"]
                         for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('🏛️ ','').replace('[','').replace(']','')}]({i['link']})")
@@ -443,74 +406,43 @@ def start_background_worker():
             @bot.message_handler(commands=['on', 'off'])
             def toggle_cmd(m):
                 try:
-                    c = load_config()
-                    is_on = ('/on' in m.text)
-                    c['system_active'] = is_on
-                    save_config(c)
-                    bot.reply_to(m, f"시스템 {'가동' if c['system_active'] else '정지'}")
+                    c = load_config(); is_on = ('/on' in m.text); c['system_active'] = is_on; save_config(c)
+                    bot.reply_to(m, f"시스템 {'가동' if is_on else '정지'}")
                 except: pass
-
-            try:
-                bot.set_my_commands([
-                    BotCommand("eco", "📅 경제지표"),
-                    BotCommand("earning", "💰 실적 발표"),
-                    BotCommand("news", "📰 뉴스"),
-                    BotCommand("p", "💰 현재가"),
-                    BotCommand("summary", "📊 요약"),
-                    BotCommand("sec", "🏛️ 공시"),
-                    BotCommand("vix", "😨 공포 지수"),
-                    BotCommand("list", "📋 목록"),
-                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제"),
-                    BotCommand("on", "🟢 가동"), BotCommand("off", "⛔ 정지"),
-                    BotCommand("help", "❓ 도움말")
-                ])
-            except: pass
 
             # --- 감시 루프 ---
             def monitor_loop():
                 nonlocal last_weekly_sent, last_daily_sent
-                
                 while True:
                     try:
                         cfg = load_config()
-                        
-                        # 1. 경제지표 알림
+                        # 경제지표
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
-                            # 주간 브리핑
+                            # 주간
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
                                     msg = "📅 *이번 주 주요 경제 일정*\n────────────────"
-                                    c = 0
+                                    c=0
                                     for e in events:
-                                        if e['impact'] == 'High':
-                                            msg += f"\n🗓️ `{e['date']} {e['time']}`\n🔥 {e['event']}"
-                                            c += 1
-                                    if c > 0:
-                                        bot.send_message(chat_id, msg, parse_mode='Markdown')
-                                        last_weekly_sent = now.strftime('%Y-%m-%d')
-
-                            # 매일 아침 브리핑
+                                        if e['impact'] == 'High': msg += f"\n🗓️ `{e['date']} {e['time']}`\n🔥 {e['event']}"; c+=1
+                                    if c>0: bot.send_message(chat_id, msg, parse_mode='Markdown'); last_weekly_sent = now.strftime('%Y-%m-%d')
+                            # 데일리
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 today = datetime.now().strftime('%Y-%m-%d')
                                 todays = [e for e in events if e['date'] == today]
                                 if todays:
                                     msg = f"☀️ *오늘({today}) 주요 일정*\n────────────────"
-                                    for e in todays:
-                                        msg += f"\n⏰ {e['time']} : {e['event']} (예상:{e['forecast']})"
-                                    bot.send_message(chat_id, msg, parse_mode='Markdown')
-                                    last_daily_sent = now.strftime('%Y-%m-%d')
+                                    for e in todays: msg += f"\n⏰ {e['time']} : {e['event']} (예상:{e['forecast']})"
+                                    bot.send_message(chat_id, msg, parse_mode='Markdown'); last_daily_sent = now.strftime('%Y-%m-%d')
 
-                        # 2. 주식 감시
+                        # 주식 감시
                         if cfg.get('system_active', True) and cfg['tickers']:
-                            cur_token = cfg['telegram']['bot_token']
-                            cur_chat = cfg['telegram']['chat_id']
+                            cur_token = cfg['telegram']['bot_token']; cur_chat = cfg['telegram']['chat_id']
                             with ThreadPoolExecutor(max_workers=5) as exe:
-                                for t, s in cfg['tickers'].items():
-                                    exe.submit(analyze_ticker, t, s, cur_token, cur_chat)
-                                    
+                                for t, s in cfg['tickers'].items(): exe.submit(analyze_ticker, t, s, cur_token, cur_chat)
                     except Exception as e: write_log(f"Loop Err: {e}")
                     time.sleep(60)
 
@@ -520,19 +452,15 @@ def start_background_worker():
                     # 뉴스
                     if settings.get('뉴스') or settings.get('SEC'):
                         if ticker not in news_cache: news_cache[ticker] = set()
-                        items = get_integrated_news(ticker, is_sec_search=False)
+                        items = get_integrated_news(ticker, False)
                         for item in items:
                             if any(x for x in news_cache[ticker] if x == item['link']): continue
-                            
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
                             should_send = (is_sec and settings.get('SEC')) or (not is_sec and settings.get('뉴스'))
-                            
                             if should_send:
                                 prefix = "🏛️" if is_sec else "📰"
-                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                            data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
                                 news_cache[ticker].add(item['link'])
-                    
                     # 가격
                     if settings.get('가격_3%'):
                         stock = yf.Ticker(ticker)
@@ -543,34 +471,23 @@ def start_background_worker():
                             if abs(pct) >= 3.0:
                                 last = price_alert_cache.get(ticker, 0)
                                 if abs(pct - last) >= 1.0:
-                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                                data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
+                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
-                                    
                     # RSI
                     if settings.get('RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
-                            delta = h['Close'].diff()
-                            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-                            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-                            rs = gain / loss
-                            rsi = 100 - (100 / (1 + rs)).iloc[-1]
+                            delta = h['Close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                            rs = gain / loss; rsi = 100 - (100 / (1 + rs)).iloc[-1]
                             status = rsi_alert_status.get(ticker, "NORMAL")
-                            if rsi >= 70 and status != "OB":
-                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔥 [{ticker}] RSI 과매수 ({rsi:.1f})"})
-                                rsi_alert_status[ticker] = "OB"
-                            elif rsi <= 30 and status != "OS":
-                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"💧 [{ticker}] RSI 과매도 ({rsi:.1f})"})
-                                rsi_alert_status[ticker] = "OS"
+                            if rsi >= 70 and status != "OB": requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔥 [{ticker}] RSI 과매수 ({rsi:.1f})"}); rsi_alert_status[ticker] = "OB"
+                            elif rsi <= 30 and status != "OS": requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"💧 [{ticker}] RSI 과매도 ({rsi:.1f})"}); rsi_alert_status[ticker] = "OS"
                             elif 35 < rsi < 65: rsi_alert_status[ticker] = "NORMAL"
-
                 except: pass
 
             t_mon = threading.Thread(target=monitor_loop, daemon=True)
             t_mon.start()
             bot.infinity_polling(timeout=10, long_polling_timeout=5)
-            
         except Exception as e: write_log(f"Bot Error: {e}")
 
     t_bot = threading.Thread(target=run_bot_system, daemon=True)
@@ -599,11 +516,9 @@ with st.sidebar:
     else: st.warning("📂 Local Mode")
 
     if st.toggle("System Power", value=config.get('system_active', True)):
-        st.success("🟢 Active")
-        config['system_active'] = True
+        st.success("🟢 Active"); config['system_active'] = True
     else:
-        st.error("⛔ Paused")
-        config['system_active'] = False
+        st.error("⛔ Paused"); config['system_active'] = False
     save_config(config)
 
     with st.expander("🔑 Keys"):
@@ -613,7 +528,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V45)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V46)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
@@ -633,18 +548,14 @@ with t2:
     st.markdown("#### 📢 알림 설정")
     eco_mode = st.checkbox("📢 경제지표/연준 알림 (CPI, FOMC 등)", value=config.get('eco_mode', True))
     if eco_mode != config.get('eco_mode', True):
-        config['eco_mode'] = eco_mode
-        save_config(config)
-        st.toast("경제지표 알림 설정 저장됨")
+        config['eco_mode'] = eco_mode; save_config(config); st.toast("경제지표 알림 설정 저장됨")
 
     st.divider()
-    
     c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
     if c_all_1.button("✅ ALL ON", use_container_width=True):
         for t in config['tickers']:
             for k in ["감시_ON", "뉴스", "SEC", "가격_3%", "RSI"]: config['tickers'][t][k] = True
         save_config(config); st.rerun()
-        
     if c_all_2.button("⛔ ALL OFF", use_container_width=True):
         for t in config['tickers']:
             for k in ["감시_ON", "뉴스", "SEC", "가격_3%", "RSI"]: config['tickers'][t][k] = False
@@ -667,9 +578,7 @@ with t2:
     del_cols = st.columns([4, 1])
     del_target = del_cols[0].selectbox("삭제할 종목 선택", options=list(config['tickers'].keys()))
     if del_cols[1].button("삭제"):
-        if del_target in config['tickers']:
-            del config['tickers'][del_target]
-            save_config(config); st.rerun()
+        if del_target in config['tickers']: del config['tickers'][del_target]; save_config(config); st.rerun()
 
 with t3:
     if os.path.exists(LOG_FILE):
