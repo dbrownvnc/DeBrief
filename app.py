@@ -38,7 +38,7 @@ def write_log(msg):
     except: pass
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장 (JSONBin 연동 강화)
+# [1] 설정 로드/저장 (JSONBin 디버깅 강화)
 # ---------------------------------------------------------
 DEFAULT_OPTS = {
     "🟢 감시": True, 
@@ -67,22 +67,24 @@ def migrate_options(old_opts):
     return new_opts
 
 def get_jsonbin_config():
-    """Secrets에서 JSONBin 설정 가져오기"""
+    """Secrets에서 JSONBin 설정 가져오기 (오류 처리 강화)"""
     try:
         if "jsonbin" in st.secrets:
+            m_key = st.secrets["jsonbin"]["master_key"]
+            b_id = st.secrets["jsonbin"]["bin_id"]
             return {
-                "url": f"https://api.jsonbin.io/v3/b/{st.secrets['jsonbin']['bin_id']}",
+                "url": f"https://api.jsonbin.io/v3/b/{b_id}",
                 "headers": {
                     'Content-Type': 'application/json',
-                    'X-Master-Key': st.secrets["jsonbin"]["master_key"]
+                    'X-Master-Key': m_key
                 }
             }
     except Exception as e:
-        write_log(f"Secrets Error: {e}")
+        write_log(f"Secrets Read Error: {e}")
     return None
 
 def load_config():
-    # 1. 기본 설정 정의
+    # 1. 기본값 생성
     config = {
         "system_active": True,
         "eco_mode": True,
@@ -97,19 +99,20 @@ def load_config():
     loaded_data = None
     jb_conf = get_jsonbin_config()
     
-    # 2. Cloud Load (JSONBin) - 최우선
+    # 2. Cloud Load (JSONBin)
     if jb_conf:
         try:
+            # /latest 엔드포인트 사용
             resp = requests.get(f"{jb_conf['url']}/latest", headers=jb_conf['headers'], timeout=5)
             if resp.status_code == 200:
                 loaded_data = resp.json().get('record')
-                write_log("✅ Cloud Config Loaded")
+                write_log("✅ Cloud Config Loaded Successfully")
             else:
-                write_log(f"❌ Cloud Load Fail: {resp.status_code} - {resp.text}")
+                write_log(f"⚠️ Cloud Load Failed: {resp.status_code} - {resp.text}")
         except Exception as e:
-            write_log(f"❌ Cloud Connection Error: {e}")
+            write_log(f"⚠️ Cloud Connection Error: {e}")
     
-    # 3. Local Backup Load (Cloud 실패 시에만)
+    # 3. Local Backup Load (Cloud 실패 시)
     if not loaded_data and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -117,20 +120,20 @@ def load_config():
                 write_log("⚠️ Loaded from Local Backup")
         except: pass
 
-    # 4. 데이터 병합
+    # 4. 데이터 병합 (Merge)
     if loaded_data:
         if "telegram" in loaded_data: config['telegram'] = loaded_data['telegram']
         if "system_active" in loaded_data: config['system_active'] = loaded_data['system_active']
         if "eco_mode" in loaded_data: config['eco_mode'] = loaded_data['eco_mode']
         if "news_history" in loaded_data: config['news_history'] = loaded_data['news_history']
         
-        # 티커 복구 (중요)
+        # 티커 복구 (기존 키 덮어쓰기)
         if "tickers" in loaded_data and loaded_data['tickers']:
-            config['tickers'] = {} # 기본값 날리고 로드된 값으로 교체
+            config['tickers'] = {} 
             for t, opts in loaded_data['tickers'].items():
                 config['tickers'][t] = migrate_options(opts)
 
-    # 5. Secrets 강제 적용 (보안 키)
+    # 5. Secrets 강제 적용 (가장 높은 우선순위)
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -140,14 +143,16 @@ def load_config():
     return config
 
 def save_config(config):
-    # 1. Cloud Save
+    # 1. Cloud Save (동기 방식)
     jb_conf = get_jsonbin_config()
     if jb_conf:
         try:
-            # 비동기로 처리하지 않고 동기로 처리하여 저장 보장
-            requests.put(jb_conf['url'], headers=jb_conf['headers'], json=config, timeout=5)
+            # PUT 요청은 bin_id URL 그대로 사용
+            resp = requests.put(jb_conf['url'], headers=jb_conf['headers'], json=config, timeout=5)
+            if resp.status_code != 200:
+                write_log(f"❌ Cloud Save Error: {resp.status_code} - {resp.text}")
         except Exception as e:
-            write_log(f"Save Cloud Error: {e}")
+            write_log(f"❌ Cloud Save Connection Error: {e}")
 
     # 2. Local Save
     try:
@@ -156,7 +161,7 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진 (뉴스 로직 유지)
+# [2] 데이터 엔진 (뉴스 로직)
 # ---------------------------------------------------------
 def clean_title_for_check(title):
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', title).lower()
@@ -299,12 +304,12 @@ def start_background_worker():
         try:
             bot = telebot.TeleBot(token)
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V58 Ready\n(저장소 연결 강화됨)")
+            try: bot.send_message(chat_id, "🤖 DeBrief V59 Connected\n(설정 저장소 연결됨)")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                bot.reply_to(m, "🤖 *DeBrief V58*\n/on /off : 제어\n/news [티커] : 뉴스\n/list : 목록", parse_mode='Markdown')
+                bot.reply_to(m, "🤖 *DeBrief V59*\n/on /off : 제어\n/news [티커] : 뉴스\n/list : 목록", parse_mode='Markdown')
 
             @bot.message_handler(commands=['on'])
             def on_cmd(m):
@@ -445,16 +450,22 @@ config = load_config()
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # [Connection Test]
+    # [Connection Test with Detailed Error]
     jb = get_jsonbin_config()
     if jb:
         st.success("☁️ Secrets Found")
         if st.button("Test Connection"):
             try:
+                # v3 API /latest
                 r = requests.get(f"{jb['url']}/latest", headers=jb['headers'])
-                if r.status_code == 200: st.toast("✅ 연결 성공!"); st.write(r.json().get('record', {}).get('tickers', {}))
-                else: st.error(f"❌ 연결 실패: {r.status_code}")
-            except Exception as e: st.error(f"❌ 에러: {e}")
+                if r.status_code == 200: 
+                    st.toast("✅ 연결 성공!"); st.write("Data:", r.json().get('record', {}).get('tickers', {}))
+                else: 
+                    # 에러 상세 출력
+                    st.error(f"❌ 연결 실패: {r.status_code}")
+                    st.code(r.text, language='json')
+                    st.warning("위 에러 메시지를 확인하세요. (Unauthorized = 키 오류 / Forbidden = 권한 오류)")
+            except Exception as e: st.error(f"❌ 요청 에러: {e}")
     else:
         st.error("❌ Secrets Not Found")
         st.info("Set 'jsonbin' in st.secrets")
@@ -472,7 +483,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V58)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V59)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
