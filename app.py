@@ -56,7 +56,7 @@ def get_jsonbin_url():
     except: pass
     return None
 
-# [핵심] 아이콘이 포함된 기본 옵션
+# [핵심] 아이콘이 포함된 기본 옵션 (복구됨)
 DEFAULT_OPTS = {
     "🟢 감시": True, 
     "📰 뉴스": True, 
@@ -71,19 +71,26 @@ DEFAULT_OPTS = {
 }
 
 def migrate_options(old_opts):
+    """구버전 키(아이콘 없음)를 신버전(아이콘 있음)으로 자동 변환"""
     new_opts = DEFAULT_OPTS.copy()
+    # 매핑 테이블 (구 -> 신)
     mapping = {
         "감시_ON": "🟢 감시", "뉴스": "📰 뉴스", "SEC": "🏛️ SEC",
         "가격_3%": "📈 급등락(3%)", "거래량_2배": "📊 거래량(2배)",
         "52주_신고가": "🚀 신고가", "RSI": "📉 RSI", "MA_크로스": "〰️ MA크로스",
         "볼린저": "🛁 볼린저", "MACD": "🌊 MACD"
     }
+    
     for old_k, val in old_opts.items():
-        if old_k in mapping: new_opts[mapping[old_k]] = val 
-        elif old_k in new_opts: new_opts[old_k] = val
+        if old_k in mapping:
+            new_opts[mapping[old_k]] = val # 구버전 값 승계
+        elif old_k in new_opts:
+            new_opts[old_k] = val # 이미 신버전 키라면 그대로
+            
     return new_opts
 
 def load_config():
+    # 기본 구조
     config = {
         "system_active": True,
         "eco_mode": True,
@@ -94,29 +101,45 @@ def load_config():
         },
         "news_history": {}
     }
+    
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
+    
     loaded_data = None
     
+    # 1. Cloud Load
     if url and headers:
         try:
             resp = requests.get(f"{url}/latest", headers=headers, timeout=5)
-            if resp.status_code == 200: loaded_data = resp.json()['record']
+            if resp.status_code == 200:
+                loaded_data = resp.json()['record']
         except: pass
     
+    # 2. Local Backup Load
     if not loaded_data and os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f: loaded_data = json.load(f)
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                loaded_data = json.load(f)
         except: pass
 
+    # 데이터 병합 및 마이그레이션
     if loaded_data:
         if "telegram" in loaded_data: config['telegram'] = loaded_data['telegram']
         if "system_active" in loaded_data: config['system_active'] = loaded_data['system_active']
         if "eco_mode" in loaded_data: config['eco_mode'] = loaded_data['eco_mode']
         if "news_history" in loaded_data: config['news_history'] = loaded_data['news_history']
+        
         if "tickers" in loaded_data:
             for t, opts in loaded_data['tickers'].items():
                 config['tickers'][t] = migrate_options(opts)
+
+    # 3. Secrets (최우선)
+    try:
+        if "telegram" in st.secrets:
+            config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
+            config['telegram']['chat_id'] = st.secrets["telegram"]["chat_id"]
+    except: pass
+    
     return config
 
 def save_config(config):
@@ -131,38 +154,14 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진 (수정: 필터링 추가 및 빈도 조절)
+# [2] 데이터 엔진
 # ---------------------------------------------------------
-# [NEW] 관련성 필터 함수
-def is_relevant_news(title):
-    # 경제/증시 관련 키워드 (하나라도 포함되면 통과)
-    keywords = [
-        "stock", "market", "economy", "price", "earnings", "profit", "revenue", "trade", 
-        "invest", "chart", "analysis", "forecast", "report", "sec", "filing", "dividend",
-        "shares", "equity", "nasdaq", "nyse", "sp500", "dow", "bull", "bear",
-        "주식", "증시", "경제", "가격", "실적", "수익", "매출", "거래", "투자", "차트", 
-        "분석", "전망", "보고서", "공시", "배당", "급등", "급락", "상승", "하락", "지수"
-    ]
-    # 제외 키워드 (포함되면 무조건 제외)
-    exclude_keywords = ["sport", "football", "soccer", "game", "casino", "lotto", "스포츠", "축구", "게임", "로또"]
-    
-    title_lower = title.lower()
-    
-    for k in exclude_keywords:
-        if k in title_lower: return False
-    
-    for k in keywords:
-        if k in title_lower: return True
-        
-    return False # 관련 키워드 없으면 제외
-
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
     if is_sec_search:
         search_urls = [f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en"]
     else:
-        # 검색어에 stock market 추가하여 정확도 높임
-        search_urls = [f"https://news.google.com/rss/search?q={ticker}+stock+market+news+when:1d&hl=en-US&gl=US&ceid=US:en"]
+        search_urls = [f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en"]
 
     collected_items = []
     seen_links = set()
@@ -172,25 +171,17 @@ def get_integrated_news(ticker, is_sec_search=False):
         try:
             response = requests.get(url, headers=headers, timeout=3)
             root = ET.fromstring(response.content)
-            # [수정] 빈도 조절: [:3] -> [:1] (가장 최신 1개만 가져옴)
-            for item in root.findall('.//item')[:1]: 
+            for item in root.findall('.//item')[:3]: 
                 try:
                     title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
                     pubDate = item.find('pubDate').text
-                    
                     if link in seen_links: continue
                     seen_links.add(link)
-                    
-                    # [수정] 관련성 필터 적용 (SEC 공시는 필터링 안 함)
-                    if not is_sec_search and not is_relevant_news(title):
-                        continue
                     
                     dt_obj = None
                     try: dt_obj = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
                     except: pass
-                    
-                    # 24시간 지난 뉴스는 무시
                     if dt_obj and (datetime.utcnow() - dt_obj) > timedelta(hours=24): continue
                     date_str = dt_obj.strftime('%m/%d %H:%M') if dt_obj else "Recent"
                     
@@ -277,14 +268,14 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief 가동\n뉴스 필터링 및 빈도 조절 적용됨.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V55 가동\n아이콘 및 전체 기능 복구 완료.")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief 사용법*\n"
-                       "/on : 시스템 켜기\n"
-                       "/off : 시스템 끄기\n"
+                msg = ("🤖 *DeBrief V55*\n"
+                       "/on : 시스템 켜기 (복구됨)\n"
+                       "/off : 시스템 끄기 (복구됨)\n"
                        "/earning [티커] : 실적발표\n"
                        "/summary [티커] : 재무요약\n"
                        "/eco : 경제지표\n"
@@ -297,15 +288,20 @@ def start_background_worker():
                        "/ping : 생존확인")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
+            # [복구] on/off 명령어 (즉시 반영)
             @bot.message_handler(commands=['on'])
             def on_cmd(m):
-                c = load_config(); c['system_active'] = True; save_config(c)
-                bot.reply_to(m, "🟢 시스템 가동")
+                c = load_config()
+                c['system_active'] = True
+                save_config(c)
+                bot.reply_to(m, "🟢 시스템 가동 (모니터링 시작)")
 
             @bot.message_handler(commands=['off'])
             def off_cmd(m):
-                c = load_config(); c['system_active'] = False; save_config(c)
-                bot.reply_to(m, "⛔ 시스템 정지")
+                c = load_config()
+                c['system_active'] = False
+                save_config(c)
+                bot.reply_to(m, "⛔ 시스템 정지 (모니터링 중단)")
 
             @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
@@ -357,6 +353,7 @@ def start_background_worker():
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
                 try:
+                    bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
                     if not events: return bot.reply_to(m, "❌ 일정 없음")
                     msg = "📅 *주요 경제 일정 (USD)*\n────────────────"
@@ -463,8 +460,10 @@ def start_background_worker():
                     time.sleep(60)
 
             def analyze_ticker(ticker, settings, token, chat_id):
+                # 구버전 키 방지 (마이그레이션된 키 사용)
                 if not settings.get('🟢 감시', True): return
                 try:
+                    # 뉴스
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         current_config = load_config()
                         history = current_config.get('news_history', {})
@@ -490,6 +489,7 @@ def start_background_worker():
                             current_config['news_history'] = history
                             save_config(current_config)
 
+                    # 가격 (3%)
                     if settings.get('📈 급등락(3%)'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
@@ -501,6 +501,7 @@ def start_background_worker():
                                 if abs(pct - last) >= 1.0:
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
+                    # RSI
                     if settings.get('📉 RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
@@ -514,9 +515,11 @@ def start_background_worker():
 
             t_mon = threading.Thread(target=monitor_loop, daemon=True, name="DeBrief_Worker")
             t_mon.start()
+            
             while True:
                 try: bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
                 except: time.sleep(5)
+
         except Exception as e: write_log(f"Bot Error: {e}")
 
     t_bot = threading.Thread(target=run_bot_system, daemon=True, name="DeBrief_Worker")
@@ -579,6 +582,7 @@ with t2:
 
     st.divider()
     c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
+    # [수정] ALL ON 버튼 로직 개선
     if c_all_1.button("✅ ALL ON", use_container_width=True):
         for t in config['tickers']:
             for k in config['tickers'][t]: config['tickers'][t][k] = True
