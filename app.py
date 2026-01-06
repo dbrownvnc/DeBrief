@@ -27,7 +27,7 @@ price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
 
 # ---------------------------------------------------------
-# [0] 로그 및 유틸
+# [0] 로그 기록
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -38,27 +38,19 @@ def write_log(msg):
     except: pass
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장 (클라우드 강제 동기화)
+# [1] 설정 로드/저장 (JSONBin 연동 강화)
 # ---------------------------------------------------------
-def get_jsonbin_config():
-    """Secrets에서 설정 가져오기 및 검증"""
-    try:
-        if "jsonbin" in st.secrets:
-            return {
-                'url': f"https://api.jsonbin.io/v3/b/{st.secrets['jsonbin']['bin_id']}",
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'X-Master-Key': st.secrets['jsonbin']['master_key']
-                }
-            }
-    except Exception as e:
-        write_log(f"Secrets Error: {e}")
-    return None
-
 DEFAULT_OPTS = {
-    "🟢 감시": True, "📰 뉴스": True, "🏛️ SEC": True, 
-    "📈 급등락(3%)": True, "📊 거래량(2배)": False, 
-    "🚀 신고가": True, "📉 RSI": False
+    "🟢 감시": True, 
+    "📰 뉴스": True, 
+    "🏛️ SEC": True, 
+    "📈 급등락(3%)": True,
+    "📊 거래량(2배)": False, 
+    "🚀 신고가": True, 
+    "📉 RSI": False,
+    "〰️ MA크로스": False, 
+    "🛁 볼린저": False, 
+    "🌊 MACD": False
 }
 
 def migrate_options(old_opts):
@@ -66,44 +58,63 @@ def migrate_options(old_opts):
     mapping = {
         "감시_ON": "🟢 감시", "뉴스": "📰 뉴스", "SEC": "🏛️ SEC",
         "가격_3%": "📈 급등락(3%)", "거래량_2배": "📊 거래량(2배)",
-        "52주_신고가": "🚀 신고가", "RSI": "📉 RSI"
+        "52주_신고가": "🚀 신고가", "RSI": "📉 RSI", "MA_크로스": "〰️ MA크로스",
+        "볼린저": "🛁 볼린저", "MACD": "🌊 MACD"
     }
     for old_k, val in old_opts.items():
         if old_k in mapping: new_opts[mapping[old_k]] = val
         elif old_k in new_opts: new_opts[old_k] = val
     return new_opts
 
+def get_jsonbin_config():
+    """Secrets에서 JSONBin 설정 가져오기"""
+    try:
+        if "jsonbin" in st.secrets:
+            return {
+                "url": f"https://api.jsonbin.io/v3/b/{st.secrets['jsonbin']['bin_id']}",
+                "headers": {
+                    'Content-Type': 'application/json',
+                    'X-Master-Key': st.secrets["jsonbin"]["master_key"]
+                }
+            }
+    except Exception as e:
+        write_log(f"Secrets Error: {e}")
+    return None
+
 def load_config():
-    # 1. 기본 템플릿
+    # 1. 기본 설정 정의
     config = {
         "system_active": True,
         "eco_mode": True,
         "telegram": {"bot_token": "", "chat_id": ""}, 
-        "tickers": { "TSLA": DEFAULT_OPTS.copy(), "NVDA": DEFAULT_OPTS.copy() },
+        "tickers": {
+            "TSLA": DEFAULT_OPTS.copy(),
+            "NVDA": DEFAULT_OPTS.copy()
+        },
         "news_history": {}
     }
     
-    jb = get_jsonbin_config()
     loaded_data = None
+    jb_conf = get_jsonbin_config()
     
-    # 2. 클라우드 로드 시도 (우선순위 최상)
-    if jb:
+    # 2. Cloud Load (JSONBin) - 최우선
+    if jb_conf:
         try:
-            resp = requests.get(f"{jb['url']}/latest", headers=jb['headers'], timeout=5)
+            resp = requests.get(f"{jb_conf['url']}/latest", headers=jb_conf['headers'], timeout=5)
             if resp.status_code == 200:
                 loaded_data = resp.json().get('record')
-                write_log("☁️ Cloud Config Loaded")
+                write_log("✅ Cloud Config Loaded")
             else:
-                write_log(f"☁️ Cloud Load Failed: {resp.status_code}")
+                write_log(f"❌ Cloud Load Fail: {resp.status_code} - {resp.text}")
         except Exception as e:
-            write_log(f"☁️ Cloud Err: {e}")
+            write_log(f"❌ Cloud Connection Error: {e}")
     
-    # 3. 로컬 로드 (클라우드 실패 시 백업)
+    # 3. Local Backup Load (Cloud 실패 시에만)
     if not loaded_data and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 loaded_data = json.load(f)
-                write_log("📂 Local Config Loaded")
+                write_log("⚠️ Loaded from Local Backup")
         except: pass
 
     # 4. 데이터 병합
@@ -112,12 +123,14 @@ def load_config():
         if "system_active" in loaded_data: config['system_active'] = loaded_data['system_active']
         if "eco_mode" in loaded_data: config['eco_mode'] = loaded_data['eco_mode']
         if "news_history" in loaded_data: config['news_history'] = loaded_data['news_history']
-        if "tickers" in loaded_data:
-            config['tickers'] = {}
+        
+        # 티커 복구 (중요)
+        if "tickers" in loaded_data and loaded_data['tickers']:
+            config['tickers'] = {} # 기본값 날리고 로드된 값으로 교체
             for t, opts in loaded_data['tickers'].items():
                 config['tickers'][t] = migrate_options(opts)
 
-    # 5. Secrets 키 강제 적용
+    # 5. Secrets 강제 적용 (보안 키)
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -127,35 +140,37 @@ def load_config():
     return config
 
 def save_config(config):
-    jb = get_jsonbin_config()
-    success = False
-    
-    # 1. 클라우드 저장
-    if jb:
+    # 1. Cloud Save
+    jb_conf = get_jsonbin_config()
+    if jb_conf:
         try:
-            resp = requests.put(jb['url'], headers=jb['headers'], json=config, timeout=5)
-            if resp.status_code == 200: success = True
-        except: pass
-        
-    # 2. 로컬 백업 저장
+            # 비동기로 처리하지 않고 동기로 처리하여 저장 보장
+            requests.put(jb_conf['url'], headers=jb_conf['headers'], json=config, timeout=5)
+        except Exception as e:
+            write_log(f"Save Cloud Error: {e}")
+
+    # 2. Local Save
     try:
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
     except: pass
-    
-    return success
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진
+# [2] 데이터 엔진 (뉴스 로직 유지)
 # ---------------------------------------------------------
 def clean_title_for_check(title):
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', title).lower()
 
 def is_relevant_news(title):
-    exclude = ['sport', 'game', 'casino', 'coupon', 'deal', 'zodiac', 'football', 'soccer', 'baseball', '스포츠', '야구', '축구', '로또']
-    t_low = title.lower()
-    for kw in exclude:
-        if kw in t_low: return False
+    exclude_keywords = [
+        'sport', 'baseball', 'football', 'soccer', 'game', 'casino', 
+        'giveaway', 'lottery', 'horoscope', 'zodiac', 'celebrity', 
+        'movie review', 'best deal', 'coupon', 'discount code',
+        '스포츠', '야구', '축구', '연예', '방송', '드라마', '영화'
+    ]
+    title_lower = title.lower()
+    for kw in exclude_keywords:
+        if kw in title_lower: return False
     return True
 
 def get_integrated_news(ticker, is_sec_search=False):
@@ -167,64 +182,103 @@ def get_integrated_news(ticker, is_sec_search=False):
         search_urls.append((f"https://news.google.com/rss/search?q={ticker}+stock+finance+news+when:1d&hl=en-US&gl=US&ceid=US:en", "US"))
         search_urls.append((f"https://news.google.com/rss/search?q={ticker}+주가+실적+공시+when:1d&hl=ko&gl=KR&ceid=KR:ko", "KR"))
 
-    items = []
-    seen = set()
-    trans = GoogleTranslator(source='auto', target='ko')
+    collected_items = []
+    seen_titles = set()
+    translator = GoogleTranslator(source='auto', target='ko')
 
     def fetch(url_tuple):
         url, region = url_tuple
         try:
-            resp = requests.get(url, headers=headers, timeout=3)
-            root = ET.fromstring(resp.content)
-            for item in root.findall('.//item')[:5]:
+            response = requests.get(url, headers=headers, timeout=3)
+            root = ET.fromstring(response.content)
+            for item in root.findall('.//item')[:5]: 
                 try:
-                    title = item.find('title').text.split(' - ')[0]
-                    if not is_relevant_news(title): continue
-                    
-                    clean = clean_title_for_check(title)
-                    if clean in seen: continue
-                    seen.add(clean)
-                    
+                    title_raw = item.find('title').text
+                    title = title_raw.split(' - ')[0]
+                    link = item.find('link').text
                     pubDate = item.find('pubDate').text
-                    dt = datetime.strptime(pubDate.replace(' GMT',''), '%a, %d %b %Y %H:%M:%S')
-                    if (datetime.utcnow() - dt) > timedelta(hours=24): continue
                     
-                    is_breaking = (datetime.utcnow() - dt) < timedelta(hours=1)
+                    if not is_relevant_news(title): continue
+
+                    clean_t = clean_title_for_check(title)
+                    if clean_t in seen_titles: continue
+                    seen_titles.add(clean_t)
                     
-                    display_title = title
+                    dt_obj = None
+                    is_breaking = False
+                    try: 
+                        dt_obj = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
+                        if (datetime.utcnow() - dt_obj) < timedelta(hours=1): is_breaking = True
+                    except: pass
+                    
+                    if dt_obj and (datetime.utcnow() - dt_obj) > timedelta(hours=24): continue
+                    date_str = dt_obj.strftime('%m/%d %H:%M') if dt_obj else "Recent"
+                    
+                    final_title = title
                     if region == "US":
-                        try: display_title = trans.translate(title[:150])
-                        except: pass
+                        try: final_title = translator.translate(title[:150]) 
+                        except: final_title = title
                     
                     prefix = "🏛️" if is_sec_search else ("🇰🇷" if region == "KR" else "📰")
-                    items.append({
-                        'title_full': title, 'title': f"{prefix} {display_title}",
-                        'link': item.find('link').text, 'date': dt.strftime('%m/%d %H:%M'),
-                        'is_breaking': is_breaking, 'timestamp': dt
+                    
+                    collected_items.append({
+                        'title_full': title, 
+                        'title': f"{prefix} {final_title}", 
+                        'raw_title': title, 
+                        'link': link, 
+                        'date': date_str,
+                        'is_breaking': is_breaking,
+                        'timestamp': dt_obj if dt_obj else datetime.utcnow()
                     })
                 except: continue
         except: pass
     
-    for u in search_urls: fetch(u)
-    items.sort(key=lambda x: x['timestamp'], reverse=True)
-    return items
+    for url_t in search_urls: fetch(url_t)
+    collected_items.sort(key=lambda x: x['timestamp'], reverse=True)
+    return collected_items
+
+def get_finviz_data(ticker):
+    try:
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        try: scraper = cloudscraper.create_scraper(); resp = scraper.get(url, timeout=5); text = resp.text
+        except: headers = {'User-Agent': 'Mozilla/5.0'}; resp = requests.get(url, headers=headers, timeout=5); text = resp.text
+        dfs = pd.read_html(text)
+        data = {}
+        for df in dfs:
+            if 'P/E' in df.to_string():
+                for i in range(0, len(df.columns), 2):
+                    try:
+                        keys = df.iloc[:, i]; values = df.iloc[:, i+1]
+                        for k, v in zip(keys, values): data[str(k)] = str(v)
+                    except: pass
+        return data
+    except: return {}
 
 def get_economic_events():
     try:
         scraper = cloudscraper.create_scraper()
-        resp = scraper.get("https://nfs.faireconomy.media/ff_calendar_thisweek.xml")
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+        resp = scraper.get(url)
+        if resp.status_code != 200: return []
         root = ET.fromstring(resp.content)
         events = []
-        trans = GoogleTranslator(source='auto', target='ko')
-        for e in root.findall('event'):
-            if e.find('country').text == 'USD' and e.find('impact').text in ['High', 'Medium']:
-                try: title = trans.translate(e.find('title').text)
-                except: title = e.find('title').text
-                events.append({
-                    'date': e.find('date').text, 'time': e.find('time').text,
-                    'event': title, 'forecast': e.find('forecast').text or ""
-                })
-        return sorted(events, key=lambda x: (x['date'], x['time']))
+        translator = GoogleTranslator(source='auto', target='ko')
+        for event in root.findall('event'):
+            if event.find('country').text != 'USD': continue
+            if event.find('impact').text not in ['High', 'Medium']: continue
+            title = event.find('title').text
+            try: title = translator.translate(title)
+            except: pass
+            events.append({
+                'date': event.find('date').text,
+                'time': event.find('time').text,
+                'event': title,
+                'impact': event.find('impact').text,
+                'forecast': event.find('forecast').text or "",
+                'id': f"{event.find('date').text}_{event.find('time').text}_{title}"
+            })
+        events.sort(key=lambda x: (x['date'], x['time']))
+        return events
     except: return []
 
 # ---------------------------------------------------------
@@ -238,144 +292,240 @@ def start_background_worker():
     def run_bot_system():
         time.sleep(1)
         cfg = load_config()
-        token = cfg['telegram']['bot_token']; chat_id = cfg['telegram']['chat_id']
+        token = cfg['telegram']['bot_token']
+        chat_id = cfg['telegram']['chat_id']
         if not token: return
         
         try:
             bot = telebot.TeleBot(token)
-            last_sent = None
-            
-            try: bot.send_message(chat_id, "🤖 *DeBrief V58 재가동*\n클라우드 설정 확인 중...")
+            last_daily_sent = None
+            try: bot.send_message(chat_id, "🤖 DeBrief V58 Ready\n(저장소 연결 강화됨)")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
-            def start(m): bot.reply_to(m, "🤖 DeBrief V58 Running")
+            def start_cmd(m): 
+                bot.reply_to(m, "🤖 *DeBrief V58*\n/on /off : 제어\n/news [티커] : 뉴스\n/list : 목록", parse_mode='Markdown')
+
+            @bot.message_handler(commands=['on'])
+            def on_cmd(m):
+                c = load_config(); c['system_active'] = True; save_config(c)
+                bot.reply_to(m, "🟢 감시 시작")
+
+            @bot.message_handler(commands=['off'])
+            def off_cmd(m):
+                c = load_config(); c['system_active'] = False; save_config(c)
+                bot.reply_to(m, "⛔ 감시 중단")
 
             @bot.message_handler(commands=['news'])
-            def news(m):
+            def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    items = get_integrated_news(t)
+                    items = get_integrated_news(t, False)
                     if not items: return bot.reply_to(m, "뉴스 없음")
-                    msg = "\n\n".join([f"▪️ `[{i['date']}]` [{i['title']}]({i['link']})" for i in items[:5]])
-                    bot.reply_to(m, f"📰 *{t} 뉴스*\n{msg}", parse_mode='Markdown', disable_web_page_preview=True)
+                    msg = [f"📰 *{t} News*"]
+                    for i in items[:5]: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
+                    bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
                 except: pass
 
-            # 기본 커맨드 핸들러들 생략 (이전과 동일하다고 가정)
+            @bot.message_handler(commands=['list'])
+            def list_cmd(m):
+                try: c = load_config(); bot.reply_to(m, f"📋 {', '.join(c['tickers'].keys())}")
+                except: pass
+
+            @bot.message_handler(commands=['add'])
+            def add_cmd(m):
+                try:
+                    t = m.text.split()[1].upper(); c = load_config()
+                    if t not in c['tickers']: c['tickers'][t] = DEFAULT_OPTS.copy(); save_config(c); bot.reply_to(m, f"✅ {t} 저장됨")
+                except: pass
+
+            @bot.message_handler(commands=['del'])
+            def del_cmd(m):
+                try:
+                    t = m.text.split()[1].upper(); c = load_config()
+                    if t in c['tickers']: del c['tickers'][t]; save_config(c); bot.reply_to(m, f"🗑️ {t} 삭제됨")
+                except: pass
 
             def monitor_loop():
-                nonlocal last_sent
+                nonlocal last_daily_sent
                 while True:
                     try:
                         cfg = load_config()
-                        # 경제 알림 (매일 아침 8시)
+                        # 경제 일정
                         if cfg.get('eco_mode', True):
                             now = datetime.now()
-                            today = now.strftime('%Y-%m-%d')
-                            if now.hour == 8 and last_sent != today:
-                                evs = [e for e in get_economic_events() if e['date'] == today]
-                                if evs:
-                                    msg = f"☀️ *오늘({today}) 주요 일정*\n" + "\n".join([f"⏰ {e['time']} : {e['event']} ({e['forecast']})" for e in evs])
-                                    bot.send_message(chat_id, msg, parse_mode='Markdown'); last_sent = today
-                        
-                        # 뉴스 모니터링
+                            if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
+                                events = get_economic_events(); today = now.strftime('%Y-%m-%d')
+                                todays = [e for e in events if e['date'] == today]
+                                if todays:
+                                    msg = f"☀️ *오늘({today}) 일정*\n"
+                                    for e in todays: msg += f"\n⏰ {e['time']} : {e['event']}"
+                                    bot.send_message(chat_id, msg, parse_mode='Markdown'); last_daily_sent = today
+
+                        # 뉴스 & 가격
                         if cfg.get('system_active', True) and cfg['tickers']:
-                            cur_t = cfg['telegram']['bot_token']; cur_c = cfg['telegram']['chat_id']
+                            cur_token = cfg['telegram']['bot_token']; cur_chat = cfg['telegram']['chat_id']
                             with ThreadPoolExecutor(max_workers=5) as exe:
-                                for t, s in cfg['tickers'].items(): exe.submit(analyze, t, s, cur_t, cur_c)
-                    except: pass
+                                for t, s in cfg['tickers'].items(): exe.submit(analyze_ticker, t, s, cur_token, cur_chat)
+                    except Exception as e: write_log(f"Loop Err: {e}")
                     time.sleep(60)
 
-            def analyze(ticker, settings, token, chat_id):
+            def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 뉴스 로직 (몰림 방지)
+                    # 뉴스 (몰림 방지)
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
-                        curr_cfg = load_config() # 최신 로드
-                        hist = curr_cfg.get('news_history', {})
-                        if ticker not in hist: hist[ticker] = []
+                        current_config = load_config()
+                        history = current_config.get('news_history', {})
+                        if ticker not in history: history[ticker] = []
                         
-                        items = get_integrated_news(ticker)
-                        updated = False; sent_cnt = 0
+                        items = get_integrated_news(ticker, False)
+                        updated = False
+                        sent_count = 0 
                         
                         for item in items:
                             clean_t = clean_title_for_check(item['title_full'])
-                            if any(clean_title_for_check(h) == clean_t for h in hist[ticker]): continue
+                            if any(clean_title_for_check(h_title) == clean_t for h_title in history[ticker]): continue
                             
-                            is_sec = "SEC" in item['title_full']
-                            should = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
+                            is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                            should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
                             
-                            if should and (item['is_breaking'] or sent_cnt < 1):
-                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                              data={"chat_id": chat_id, "text": f"🔔 {item['title']}\n`[{item['date']}]` [링크]({item['link']})", "parse_mode": "Markdown"})
-                                hist[ticker].append(item['title_full']); updated = True; sent_cnt += 1
+                            if should_send:
+                                if item['is_breaking'] or sent_count < 1:
+                                    prefix = "🏛️" if ("SEC" in item['title']) else ("🇰🇷" if "🇰🇷" in item['title'] else "📰")
+                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+                                    history[ticker].append(item['title_full'])
+                                    sent_count += 1
+                                    updated = True
                         
                         if updated:
-                            if len(hist[ticker]) > 50: hist[ticker] = hist[ticker][-50:]
-                            curr_cfg['news_history'] = hist
-                            save_config(curr_cfg) # 클라우드 저장
-                            
-                    # 가격 로직
+                            if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
+                            current_config['news_history'] = history
+                            save_config(current_config)
+
+                    # 급등락
                     if settings.get('📈 급등락(3%)'):
-                        info = yf.Ticker(ticker).fast_info
-                        pct = ((info.last_price - info.previous_close)/info.previous_close)*100
-                        if abs(pct) >= 3.0:
-                             requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                                           data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {pct:.2f}% 변동*\n현재: ${info.last_price:.2f}", "parse_mode": "Markdown"})
+                        stock = yf.Ticker(ticker); h = stock.history(period="1d")
+                        if not h.empty:
+                            curr = h['Close'].iloc[-1]; prev = stock.fast_info.previous_close
+                            pct = ((curr - prev) / prev) * 100
+                            if abs(pct) >= 3.0:
+                                last = price_alert_cache.get(ticker, 0)
+                                if abs(pct - last) >= 1.0:
+                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n{pct:.2f}% (${curr:.2f})", "parse_mode": "Markdown"})
+                                    price_alert_cache[ticker] = pct
                 except: pass
 
-            t_mon = threading.Thread(target=monitor_loop, daemon=True, name="DeBrief_Worker"); t_mon.start()
-            while True: 
-                try: bot.infinity_polling(timeout=10, skip_pending=True)
+            t_mon = threading.Thread(target=monitor_loop, daemon=True, name="DeBrief_Worker")
+            t_mon.start()
+            while True:
+                try: bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
                 except: time.sleep(5)
         except: pass
 
-    t_bot = threading.Thread(target=run_bot_system, daemon=True, name="DeBrief_Worker"); t_bot.start()
+    t_bot = threading.Thread(target=run_bot_system, daemon=True, name="DeBrief_Worker")
+    t_bot.start()
 
 start_background_worker()
 
 # ---------------------------------------------------------
 # [4] UI
 # ---------------------------------------------------------
-st.set_page_config(page_title="DeBrief Cloud", layout="wide", page_icon="📡")
+st.set_page_config(page_title="DeBrief", layout="wide", page_icon="📡")
+st.markdown("""<style>
+    .stApp { background-color: #FFFFFF; color: #202124; }
+    .stock-card { background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px; padding: 8px 5px; margin-bottom: 6px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .stock-symbol { font-size: 1.0em; font-weight: 800; color: #1A73E8; }
+    .stock-price-box { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; font-weight: 700; }
+    .up-theme { background-color: #E6F4EA; color: #137333; } .down-theme { background-color: #FCE8E6; color: #C5221F; }
+</style>""", unsafe_allow_html=True)
+
 config = load_config()
 
 with st.sidebar:
     st.header("🎛️ Control Panel")
     
-    # [상태 표시 핵심]
-    jb_conf = get_jsonbin_config()
-    if jb_conf:
-        st.success(f"☁️ Cloud Connected\n(Bin ID: {st.secrets['jsonbin']['bin_id'][:6]}...)")
-        if st.button("🔄 Force Save to Cloud"):
-            if save_config(config): st.toast("Saved to Cloud!")
-            else: st.error("Save Failed")
+    # [Connection Test]
+    jb = get_jsonbin_config()
+    if jb:
+        st.success("☁️ Secrets Found")
+        if st.button("Test Connection"):
+            try:
+                r = requests.get(f"{jb['url']}/latest", headers=jb['headers'])
+                if r.status_code == 200: st.toast("✅ 연결 성공!"); st.write(r.json().get('record', {}).get('tickers', {}))
+                else: st.error(f"❌ 연결 실패: {r.status_code}")
+            except Exception as e: st.error(f"❌ 에러: {e}")
     else:
-        st.error("⚠️ Local Mode (Data Risk)")
-        st.info("Set 'jsonbin' in st.secrets to save data.")
+        st.error("❌ Secrets Not Found")
+        st.info("Set 'jsonbin' in st.secrets")
 
     if st.toggle("System Power", value=config.get('system_active', True)):
-        config['system_active'] = True
+        st.success("🟢 Active"); config['system_active'] = True
     else:
-        config['system_active'] = False
+        st.error("⛔ Paused"); config['system_active'] = False
     save_config(config)
 
-st.title("📡 DeBrief Dashboard V58")
-t1, t2 = st.tabs(["Main", "Config"])
+    with st.expander("🔑 Keys"):
+        bot_t = st.text_input("Bot Token", value=config['telegram'].get('bot_token', ''), type="password")
+        chat_i = st.text_input("Chat ID", value=config['telegram'].get('chat_id', ''))
+        if st.button("Save Keys"):
+            config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
+            save_config(config); st.rerun()
+
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V58)</h3>", unsafe_allow_html=True)
+t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
-    if config['tickers']:
+    if config['tickers'] and config['system_active']:
+        ticker_list = list(config['tickers'].keys())
         cols = st.columns(8)
-        for i, t in enumerate(config['tickers']):
+        for i, ticker in enumerate(ticker_list):
             try:
-                p = yf.Ticker(t).fast_info.last_price
-                cols[i%8].metric(t, f"${p:.2f}")
-            except: cols[i%8].metric(t, "N/A")
+                info = yf.Ticker(ticker).fast_info
+                curr = info.last_price; chg = ((curr - info.previous_close)/info.previous_close)*100
+                theme = "up-theme" if chg >= 0 else "down-theme"
+                with cols[i % 8]:
+                    st.markdown(f"""<div class="stock-card"><div class="stock-symbol">{ticker}</div><div class="stock-price-box {theme}">${curr:.2f} ({chg:+.2f}%)</div></div>""", unsafe_allow_html=True)
+            except: pass
 
 with t2:
-    new_t = st.text_input("Add Ticker")
-    if st.button("Add"):
-        config['tickers'][new_t.upper()] = DEFAULT_OPTS.copy()
+    st.markdown("#### 📢 알림 설정")
+    eco_mode = st.checkbox("📢 경제지표/연준 알림", value=config.get('eco_mode', True))
+    if eco_mode != config.get('eco_mode', True):
+        config['eco_mode'] = eco_mode; save_config(config); st.toast("저장됨")
+
+    st.divider()
+    c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
+    if c_all_1.button("✅ ALL ON", use_container_width=True):
+        for t in config['tickers']:
+            for k in config['tickers'][t]: config['tickers'][t][k] = True
         save_config(config); st.rerun()
         
-    st.json(config['tickers'])
+    if c_all_2.button("⛔ ALL OFF", use_container_width=True):
+        for t in config['tickers']:
+            for k in config['tickers'][t]: config['tickers'][t][k] = False
+        save_config(config); st.rerun()
+
+    input_t = st.text_input("Add Tickers")
+    if st.button("➕ Add"):
+        for t in [x.strip().upper() for x in input_t.split(',') if x.strip()]:
+            config['tickers'][t] = DEFAULT_OPTS.copy()
+        save_config(config); st.rerun()
+    
+    if config['tickers']:
+        df = pd.DataFrame(config['tickers']).T
+        edited = st.data_editor(df, use_container_width=True)
+        if not df.equals(edited):
+            config['tickers'] = edited.to_dict(orient='index')
+            save_config(config); st.toast("Saved!")
+            
+    st.divider()
+    del_cols = st.columns([4, 1])
+    del_target = del_cols[0].selectbox("삭제할 종목 선택", options=list(config['tickers'].keys()))
+    if del_cols[1].button("삭제"):
+        if del_target in config['tickers']: del config['tickers'][del_target]; save_config(config); st.rerun()
+
+with t3:
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            for line in reversed(f.readlines()[-50:]): st.text(line.strip())
