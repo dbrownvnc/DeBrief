@@ -28,7 +28,7 @@ price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
 eco_alert_cache = st.session_state['eco_alert_cache']
 
-# 제외할 키워드 (경제와 무관한 뉴스 필터링)
+# 제외할 키워드
 EXCLUDED_KEYWORDS = ['casino', 'sport', 'baseball', 'football', 'soccer', 'lotto', 'horoscope', 
                      '카지노', '스포츠', '야구', '축구', '로또', '운세', '연예']
 
@@ -96,7 +96,7 @@ def load_config():
             "TSLA": DEFAULT_OPTS.copy(),
             "NVDA": DEFAULT_OPTS.copy()
         },
-        "news_history": {} # 저장 포맷: {ticker: [hash_key1, hash_key2, ...]}
+        "news_history": {}
     }
     
     url = get_jsonbin_url(); headers = get_jsonbin_headers()
@@ -139,64 +139,50 @@ def save_config(config):
     except: pass
 
 # ---------------------------------------------------------
-# [2] 데이터 엔진 (수정됨)
+# [2] 데이터 엔진
 # ---------------------------------------------------------
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
     search_urls = []
 
-    # 1. 쿼리 설정 (한국어 뉴스 포함)
     if is_sec_search:
-        # SEC 공시는 영어 원문이 정확하므로 영어 쿼리 유지
         search_urls.append(f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en")
     else:
-        # 일반 뉴스는 미국 + 한국 소스 병행
-        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en") # 미국
-        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+주가+OR+주식+when:1d&hl=ko&gl=KR&ceid=KR:ko") # 한국
+        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en")
+        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+주가+OR+주식+when:1d&hl=ko&gl=KR&ceid=KR:ko")
 
     collected_items = []
-    seen_titles = set() # 이번 Fetch 내 중복 제거용
+    seen_titles = set()
     translator = GoogleTranslator(source='auto', target='ko')
 
     def fetch(url):
         try:
             response = requests.get(url, headers=headers, timeout=3)
             root = ET.fromstring(response.content)
-            # RSS 당 상위 5개만 파싱
             for item in root.findall('.//item')[:5]: 
                 try:
                     raw_title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
                     pubDate = item.find('pubDate').text
                     
-                    # 2. 필터링: 제외 키워드 확인
-                    if any(bad in raw_title.lower() for bad in EXCLUDED_KEYWORDS):
-                        continue
+                    if any(bad in raw_title.lower() for bad in EXCLUDED_KEYWORDS): continue
 
-                    # 날짜 파싱
                     dt_obj = None
                     try: dt_obj = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
                     except: pass
                     
-                    # 24시간 이내 기사만
                     if dt_obj and (datetime.utcnow() - dt_obj) > timedelta(hours=24): continue
-                    
                     date_str = dt_obj.strftime('%m/%d %H:%M') if dt_obj else "Recent"
                     
-                    # 3. 중복 방지 (제목 기준)
                     if raw_title in seen_titles: continue
                     seen_titles.add(raw_title)
 
-                    # 번역 (필요시)
                     title_ko = raw_title
-                    # 한글이 포함되지 않은 영어 제목만 번역 시도
                     if not any("\u3131" <= char <= "\u3163" or "\uac00" <= char <= "\ud7a3" for char in raw_title):
                         try: title_ko = translator.translate(raw_title[:150]) 
                         except: pass
                     
                     prefix = "🏛️" if is_sec_search else "📰"
-                    
-                    # 고유 ID 생성 (제목+날짜 해시) - 링크가 달라도 내용이 같으면 중복 처리하기 위함
                     unique_str = f"{raw_title}_{date_str}"
                     unique_hash = hashlib.md5(unique_str.encode()).hexdigest()
 
@@ -206,14 +192,13 @@ def get_integrated_news(ticker, is_sec_search=False):
                         'link': link, 
                         'date': date_str,
                         'dt_obj': dt_obj if dt_obj else datetime.now(),
-                        'hash': unique_hash
+                        'hash': unique_hash,
+                        'is_sec': is_sec_search
                     })
                 except Exception as e: continue
         except: pass
 
     for url in search_urls: fetch(url)
-    
-    # 4. 최신순 정렬 (속보 우선)
     collected_items.sort(key=lambda x: x['dt_obj'], reverse=True)
     return collected_items
 
@@ -290,24 +275,12 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V56 (News Improved) 가동")
+            try: bot.send_message(chat_id, "🤖 DeBrief V57 (Global Toggles & Fix) 가동")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V56*\n"
-                       "/on : 시스템 켜기\n"
-                       "/off : 시스템 끄기\n"
-                       "/earning [티커] : 실적발표\n"
-                       "/summary [티커] : 재무요약\n"
-                       "/eco : 경제지표\n"
-                       "/news [티커] : 뉴스\n"
-                       "/sec [티커] : 공시\n"
-                       "/p [티커] : 현재가\n"
-                       "/list : 감시목록\n"
-                       "/add [티커] : 추가\n"
-                       "/del [티커] : 삭제\n"
-                       "/ping : 생존확인")
+                msg = ("🤖 *DeBrief V57*\n/on /off : 시스템\n/list /add /del : 관리\n/news /sec /earning /eco : 정보")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
             @bot.message_handler(commands=['on'])
@@ -391,7 +364,7 @@ def start_background_worker():
                     items = get_integrated_news(t, False)
                     if not items: return bot.reply_to(m, "뉴스 없음")
                     msg = [f"📰 *{t} News (최신)*"]
-                    for i in items[:5]: # 명령어로 호출시에는 5개까지 보여줌
+                    for i in items[:5]: 
                         msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
                     bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
                 except: pass
@@ -481,22 +454,32 @@ def start_background_worker():
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 1. 뉴스 및 공시 (Flooding 방지 로직 적용)
+                    # 1. 뉴스 및 공시 (수정됨: 설정에 따라 각각 Fetch)
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         current_config = load_config()
                         history = current_config.get('news_history', {})
                         if ticker not in history: history[ticker] = []
                         
-                        items = get_integrated_news(ticker, False)
+                        items = []
+                        # [FIX] 뉴스 설정이 켜져있으면 일반 뉴스 수집
+                        if settings.get('📰 뉴스'):
+                            items += get_integrated_news(ticker, False)
+                        # [FIX] SEC 설정이 켜져있으면 SEC 공시 수집
+                        if settings.get('🏛️ SEC'):
+                            items += get_integrated_news(ticker, True)
+                            
+                        # 날짜순 정렬 (최신이 먼저 오게)
+                        items.sort(key=lambda x: x['dt_obj'], reverse=True)
+
                         updated = False
-                        sent_count_this_cycle = 0 # 이번 사이클에 보낸 뉴스 개수
+                        sent_count_this_cycle = 0 
                         
-                        # items는 이미 날짜 최신순으로 정렬되어 있음 (속보 우선)
                         for item in items:
-                            # 이미 보낸 뉴스인지 확인 (Hash Key 사용: 제목+날짜)
+                            # 중복 체크
                             if item['hash'] in history[ticker] or item['link'] in history[ticker]: continue
                             
-                            is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                            # [Double Check] 보내기 직전 필터링 (위에서 수집할 때 이미 걸렀지만 안전장치)
+                            is_sec = item.get('is_sec', False) or "SEC" in item['title']
                             should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
                             
                             if should_send:
@@ -505,15 +488,12 @@ def start_background_worker():
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
                                 except: pass
                                 
-                                # 히스토리에 Hash 추가 (중복 방지)
                                 history[ticker].append(item['hash'])
-                                if len(history[ticker]) > 50: history[ticker].pop(0) # 히스토리 관리
+                                if len(history[ticker]) > 50: history[ticker].pop(0)
                                 updated = True
                                 sent_count_this_cycle += 1
                             
-                            # [핵심] 한 사이클(약 60초)당 1개만 발송하고 루프 종료 -> 폭탄 방지
-                            if sent_count_this_cycle >= 1: 
-                                break 
+                            if sent_count_this_cycle >= 1: break 
 
                         if updated:
                             current_config['news_history'] = history
@@ -567,6 +547,7 @@ st.markdown("""<style>
     .stock-symbol { font-size: 1.0em; font-weight: 800; color: #1A73E8; }
     .stock-price-box { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; font-weight: 700; }
     .up-theme { background-color: #E6F4EA; color: #137333; } .down-theme { background-color: #FCE8E6; color: #C5221F; }
+    .stButton button { width: 100%; border-radius: 5px; }
 </style>""", unsafe_allow_html=True)
 
 config = load_config()
@@ -588,7 +569,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V56)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V57)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
@@ -605,37 +586,54 @@ with t1:
             except: pass
 
 with t2:
-    st.markdown("#### 📢 알림 설정")
+    st.markdown("#### 📢 기본 설정")
     eco_mode = st.checkbox("📢 경제지표/연준 알림", value=config.get('eco_mode', True))
     if eco_mode != config.get('eco_mode', True):
         config['eco_mode'] = eco_mode; save_config(config); st.toast("저장됨")
 
     st.divider()
-    c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
-    if c_all_1.button("✅ ALL ON", use_container_width=True):
-        for t in config['tickers']:
-            for k in config['tickers'][t]: config['tickers'][t][k] = True
-        save_config(config); st.rerun()
-        
-    if c_all_2.button("⛔ ALL OFF", use_container_width=True):
-        for t in config['tickers']:
-            for k in config['tickers'][t]: config['tickers'][t][k] = False
-        save_config(config); st.rerun()
+    st.markdown("#### ⚡ 항목별 일괄 설정 (Global Toggles)")
+    st.caption("아래 버튼을 누르면 모든 종목의 해당 설정이 켜지거나 꺼집니다.")
+    
+    # [NEW] 항목별 전체 On/Off 기능 구현
+    opt_keys = list(DEFAULT_OPTS.keys())
+    # 레이아웃: 항목 갯수만큼 컬럼 생성
+    toggle_cols = st.columns(len(opt_keys))
+    
+    for idx, key in enumerate(opt_keys):
+        with toggle_cols[idx]:
+            # 항목 이름 표시 (짧게)
+            clean_name = key.split()[1] if " " in key else key
+            st.markdown(f"**{clean_name}**")
+            
+            # On 버튼
+            if st.button("On", key=f"global_on_{idx}"):
+                for t in config['tickers']: config['tickers'][t][key] = True
+                save_config(config); st.rerun()
+                
+            # Off 버튼 (빨간색 텍스트 효과는 어렵지만 버튼으로 구현)
+            if st.button("Off", key=f"global_off_{idx}"):
+                for t in config['tickers']: config['tickers'][t][key] = False
+                save_config(config); st.rerun()
 
-    input_t = st.text_input("Add Tickers")
-    if st.button("➕ Add"):
+    st.divider()
+    st.markdown("#### 📋 종목 관리")
+    
+    input_t = st.text_input("Add Tickers (콤마로 구분)")
+    if st.button("➕ Add Ticker"):
         for t in [x.strip().upper() for x in input_t.split(',') if x.strip()]:
-            config['tickers'][t] = DEFAULT_OPTS.copy()
+            if t not in config['tickers']: config['tickers'][t] = DEFAULT_OPTS.copy()
         save_config(config); st.rerun()
     
     if config['tickers']:
+        # 데이터 에디터로 개별 설정 수정 가능
         df = pd.DataFrame(config['tickers']).T
         edited = st.data_editor(df, use_container_width=True)
         if not df.equals(edited):
             config['tickers'] = edited.to_dict(orient='index')
             save_config(config); st.toast("Saved!")
             
-    st.divider()
+    st.markdown("#### 🗑️ 삭제")
     del_cols = st.columns([4, 1])
     del_target = del_cols[0].selectbox("삭제할 종목 선택", options=list(config['tickers'].keys()))
     if del_cols[1].button("삭제"):
