@@ -9,17 +9,16 @@ import threading
 import telebot
 import xml.etree.ElementTree as ET
 import cloudscraper
-import hashlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
 from deep_translator import GoogleTranslator
 
-# --- ?꾨줈?앺듃 ?ㅼ젙 ---
+# --- 프로젝트 설정 ---
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
 
-# [State] 罹먯떆 諛??꾩뿭 蹂??
+# [State] 캐시 및 전역 변수
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
 if 'eco_alert_cache' not in st.session_state: st.session_state['eco_alert_cache'] = set()
@@ -28,12 +27,8 @@ price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
 eco_alert_cache = st.session_state['eco_alert_cache']
 
-# ?쒖쇅???ㅼ썙??(寃쎌젣? 臾닿????댁뒪 ?꾪꽣留?
-EXCLUDED_KEYWORDS = ['casino', 'sport', 'baseball', 'football', 'soccer', 'lotto', 'horoscope', 
-                     '移댁???, '?ㅽ룷痢?, '?쇨뎄', '異뺢뎄', '濡쒕삉', '?댁꽭', '?곗삁']
-
 # ---------------------------------------------------------
-# [0] 濡쒓렇 湲곕줉
+# [0] 로그 기록
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -44,7 +39,7 @@ def write_log(msg):
     except: pass
 
 # ---------------------------------------------------------
-# [1] ?ㅼ젙 濡쒕뱶/???
+# [1] 설정 로드/저장 (자동 마이그레이션 포함)
 # ---------------------------------------------------------
 def get_jsonbin_headers():
     try:
@@ -61,33 +56,41 @@ def get_jsonbin_url():
     except: pass
     return None
 
+# [핵심] 아이콘이 포함된 기본 옵션 (복구됨)
 DEFAULT_OPTS = {
-    "?윟 媛먯떆": True, 
-    "?벐 ?댁뒪": True, 
-    "?룢截?SEC": True, 
-    "?뱢 湲됰벑??3%)": True,
-    "?뱤 嫄곕옒??2諛?": False, 
-    "?? ?좉퀬媛": True, 
-    "?뱣 RSI": False,
-    "?곤툘 MA?щ줈??: False, 
-    "?썎 蹂쇰┛?": False, 
-    "?뙄 MACD": False
+    "🟢 감시": True, 
+    "📰 뉴스": True, 
+    "🏛️ SEC": True, 
+    "📈 급등락(3%)": True,
+    "📊 거래량(2배)": False, 
+    "🚀 신고가": True, 
+    "📉 RSI": False,
+    "〰️ MA크로스": False, 
+    "🛁 볼린저": False, 
+    "🌊 MACD": False
 }
 
 def migrate_options(old_opts):
+    """구버전 키(아이콘 없음)를 신버전(아이콘 있음)으로 자동 변환"""
     new_opts = DEFAULT_OPTS.copy()
+    # 매핑 테이블 (구 -> 신)
     mapping = {
-        "媛먯떆_ON": "?윟 媛먯떆", "?댁뒪": "?벐 ?댁뒪", "SEC": "?룢截?SEC",
-        "媛寃?3%": "?뱢 湲됰벑??3%)", "嫄곕옒??2諛?: "?뱤 嫄곕옒??2諛?",
-        "52二??좉퀬媛": "?? ?좉퀬媛", "RSI": "?뱣 RSI", "MA_?щ줈??: "?곤툘 MA?щ줈??,
-        "蹂쇰┛?": "?썎 蹂쇰┛?", "MACD": "?뙄 MACD"
+        "감시_ON": "🟢 감시", "뉴스": "📰 뉴스", "SEC": "🏛️ SEC",
+        "가격_3%": "📈 급등락(3%)", "거래량_2배": "📊 거래량(2배)",
+        "52주_신고가": "🚀 신고가", "RSI": "📉 RSI", "MA_크로스": "〰️ MA크로스",
+        "볼린저": "🛁 볼린저", "MACD": "🌊 MACD"
     }
+    
     for old_k, val in old_opts.items():
-        if old_k in mapping: new_opts[mapping[old_k]] = val
-        elif old_k in new_opts: new_opts[old_k] = val
+        if old_k in mapping:
+            new_opts[mapping[old_k]] = val # 구버전 값 승계
+        elif old_k in new_opts:
+            new_opts[old_k] = val # 이미 신버전 키라면 그대로
+            
     return new_opts
 
 def load_config():
+    # 기본 구조
     config = {
         "system_active": True,
         "eco_mode": True,
@@ -96,31 +99,41 @@ def load_config():
             "TSLA": DEFAULT_OPTS.copy(),
             "NVDA": DEFAULT_OPTS.copy()
         },
-        "news_history": {} # ????щ㎎: {ticker: [hash_key1, hash_key2, ...]}
+        "news_history": {}
     }
     
-    url = get_jsonbin_url(); headers = get_jsonbin_headers()
+    url = get_jsonbin_url()
+    headers = get_jsonbin_headers()
+    
     loaded_data = None
     
+    # 1. Cloud Load
     if url and headers:
         try:
             resp = requests.get(f"{url}/latest", headers=headers, timeout=5)
-            if resp.status_code == 200: loaded_data = resp.json()['record']
+            if resp.status_code == 200:
+                loaded_data = resp.json()['record']
         except: pass
     
+    # 2. Local Backup Load
     if not loaded_data and os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f: loaded_data = json.load(f)
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                loaded_data = json.load(f)
         except: pass
 
+    # 데이터 병합 및 마이그레이션
     if loaded_data:
         if "telegram" in loaded_data: config['telegram'] = loaded_data['telegram']
         if "system_active" in loaded_data: config['system_active'] = loaded_data['system_active']
         if "eco_mode" in loaded_data: config['eco_mode'] = loaded_data['eco_mode']
         if "news_history" in loaded_data: config['news_history'] = loaded_data['news_history']
+        
         if "tickers" in loaded_data:
-            for t, opts in loaded_data['tickers'].items(): config['tickers'][t] = migrate_options(opts)
+            for t, opts in loaded_data['tickers'].items():
+                config['tickers'][t] = migrate_options(opts)
 
+    # 3. Secrets (최우선)
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -130,91 +143,56 @@ def load_config():
     return config
 
 def save_config(config):
-    url = get_jsonbin_url(); headers = get_jsonbin_headers()
+    url = get_jsonbin_url()
+    headers = get_jsonbin_headers()
     if url and headers:
         try: requests.put(url, headers=headers, json=config, timeout=5)
         except: pass
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f: json.dump(config, f, indent=4, ensure_ascii=False)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
     except: pass
 
 # ---------------------------------------------------------
-# [2] ?곗씠???붿쭊 (?섏젙??
+# [2] 데이터 엔진
 # ---------------------------------------------------------
 def get_integrated_news(ticker, is_sec_search=False):
     headers = {"User-Agent": "Mozilla/5.0"}
-    search_urls = []
-
-    # 1. 荑쇰━ ?ㅼ젙 (?쒓뎅???댁뒪 ?ы븿)
     if is_sec_search:
-        # SEC 怨듭떆???곸뼱 ?먮Ц???뺥솗?섎?濡??곸뼱 荑쇰━ ?좎?
-        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en")
+        search_urls = [f"https://news.google.com/rss/search?q={ticker}+SEC+Filing+OR+8-K+OR+10-Q+OR+10-K+when:2d&hl=en-US&gl=US&ceid=US:en"]
     else:
-        # ?쇰컲 ?댁뒪??誘멸뎅 + ?쒓뎅 ?뚯뒪 蹂묓뻾
-        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en") # 誘멸뎅
-        search_urls.append(f"https://news.google.com/rss/search?q={ticker}+二쇨?+OR+二쇱떇+when:1d&hl=ko&gl=KR&ceid=KR:ko") # ?쒓뎅
+        search_urls = [f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en"]
 
     collected_items = []
-    seen_titles = set() # ?대쾲 Fetch ??以묐났 ?쒓굅??
+    seen_links = set()
     translator = GoogleTranslator(source='auto', target='ko')
 
     def fetch(url):
         try:
             response = requests.get(url, headers=headers, timeout=3)
             root = ET.fromstring(response.content)
-            # RSS ???곸쐞 5媛쒕쭔 ?뚯떛
-            for item in root.findall('.//item')[:5]: 
+            for item in root.findall('.//item')[:3]: 
                 try:
-                    raw_title = item.find('title').text.split(' - ')[0]
+                    title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
                     pubDate = item.find('pubDate').text
+                    if link in seen_links: continue
+                    seen_links.add(link)
                     
-                    # 2. ?꾪꽣留? ?쒖쇅 ?ㅼ썙???뺤씤
-                    if any(bad in raw_title.lower() for bad in EXCLUDED_KEYWORDS):
-                        continue
-
-                    # ?좎쭨 ?뚯떛
                     dt_obj = None
                     try: dt_obj = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
                     except: pass
-                    
-                    # 24?쒓컙 ?대궡 湲곗궗留?
                     if dt_obj and (datetime.utcnow() - dt_obj) > timedelta(hours=24): continue
-                    
                     date_str = dt_obj.strftime('%m/%d %H:%M') if dt_obj else "Recent"
                     
-                    # 3. 以묐났 諛⑹? (?쒕ぉ 湲곗?)
-                    if raw_title in seen_titles: continue
-                    seen_titles.add(raw_title)
-
-                    # 踰덉뿭 (?꾩슂??
-                    title_ko = raw_title
-                    # ?쒓????ы븿?섏? ?딆? ?곸뼱 ?쒕ぉ留?踰덉뿭 ?쒕룄
-                    if not any("\u3131" <= char <= "\u3163" or "\uac00" <= char <= "\ud7a3" for char in raw_title):
-                        try: title_ko = translator.translate(raw_title[:150]) 
-                        except: pass
+                    try: title_ko = translator.translate(title[:150]) 
+                    except: title_ko = title
                     
-                    prefix = "?룢截? if is_sec_search else "?벐"
-                    
-                    # 怨좎쑀 ID ?앹꽦 (?쒕ぉ+?좎쭨 ?댁떆) - 留곹겕媛 ?щ씪???댁슜??媛숈쑝硫?以묐났 泥섎━?섍린 ?꾪븿
-                    unique_str = f"{raw_title}_{date_str}"
-                    unique_hash = hashlib.md5(unique_str.encode()).hexdigest()
-
-                    collected_items.append({
-                        'title': f"{prefix} {title_ko}", 
-                        'raw_title': raw_title, 
-                        'link': link, 
-                        'date': date_str,
-                        'dt_obj': dt_obj if dt_obj else datetime.now(),
-                        'hash': unique_hash
-                    })
-                except Exception as e: continue
+                    prefix = "🏛️" if is_sec_search else "📰"
+                    collected_items.append({'title': f"{prefix} {title_ko}", 'raw_title': title, 'link': link, 'date': date_str})
+                except: continue
         except: pass
-
     for url in search_urls: fetch(url)
-    
-    # 4. 理쒖떊???뺣젹 (?띾낫 ?곗꽑)
-    collected_items.sort(key=lambda x: x['dt_obj'], reverse=True)
     return collected_items
 
 def get_finviz_data(ticker):
@@ -271,7 +249,7 @@ def get_economic_events():
     except: return []
 
 # ---------------------------------------------------------
-# [3] 諛깃렇?쇱슫??遊?
+# [3] 백그라운드 봇
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
@@ -280,7 +258,7 @@ def start_background_worker():
 
     def run_bot_system():
         time.sleep(1)
-        write_log("?쨼 遊??쒖뒪???쒖옉...")
+        write_log("🤖 봇 시스템 시작...")
         cfg = load_config()
         token = cfg['telegram']['bot_token']
         chat_id = cfg['telegram']['chat_id']
@@ -290,41 +268,46 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "?쨼 DeBrief V56 (News Improved) 媛??)
+            try: bot.send_message(chat_id, "🤖 DeBrief V55 가동\n아이콘 및 전체 기능 복구 완료.")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("?쨼 *DeBrief V56*\n"
-                       "/on : ?쒖뒪??耳쒓린\n"
-                       "/off : ?쒖뒪???꾧린\n"
-                       "/earning [?곗빱] : ?ㅼ쟻諛쒗몴\n"
-                       "/summary [?곗빱] : ?щТ?붿빟\n"
-                       "/eco : 寃쎌젣吏??n"
-                       "/news [?곗빱] : ?댁뒪\n"
-                       "/sec [?곗빱] : 怨듭떆\n"
-                       "/p [?곗빱] : ?꾩옱媛\n"
-                       "/list : 媛먯떆紐⑸줉\n"
-                       "/add [?곗빱] : 異붽?\n"
-                       "/del [?곗빱] : ??젣\n"
-                       "/ping : ?앹〈?뺤씤")
+                msg = ("🤖 *DeBrief V55*\n"
+                       "/on : 시스템 켜기 (복구됨)\n"
+                       "/off : 시스템 끄기 (복구됨)\n"
+                       "/earning [티커] : 실적발표\n"
+                       "/summary [티커] : 재무요약\n"
+                       "/eco : 경제지표\n"
+                       "/news [티커] : 뉴스\n"
+                       "/sec [티커] : 공시\n"
+                       "/p [티커] : 현재가\n"
+                       "/list : 감시목록\n"
+                       "/add [티커] : 추가\n"
+                       "/del [티커] : 삭제\n"
+                       "/ping : 생존확인")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
+            # [복구] on/off 명령어 (즉시 반영)
             @bot.message_handler(commands=['on'])
             def on_cmd(m):
-                c = load_config(); c['system_active'] = True; save_config(c)
-                bot.reply_to(m, "?윟 ?쒖뒪??媛??)
+                c = load_config()
+                c['system_active'] = True
+                save_config(c)
+                bot.reply_to(m, "🟢 시스템 가동 (모니터링 시작)")
 
             @bot.message_handler(commands=['off'])
             def off_cmd(m):
-                c = load_config(); c['system_active'] = False; save_config(c)
-                bot.reply_to(m, "???쒖뒪???뺤?")
+                c = load_config()
+                c['system_active'] = False
+                save_config(c)
+                bot.reply_to(m, "⛔ 시스템 정지 (모니터링 중단)")
 
-            @bot.message_handler(commands=['earning', '?ㅼ쟻'])
+            @bot.message_handler(commands=['earning', '실적'])
             def earning_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "?ъ슜踰? /earning [?곗빱]")
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /earning [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     data = get_finviz_data(t)
@@ -332,8 +315,8 @@ def start_background_worker():
                     if 'Earnings' in data and data['Earnings'] != '-':
                         e_date = data['Earnings']
                         clean_date = e_date.replace(' BMO','').replace(' AMC','')
-                        time_icon = "?截??μ쟾" if "BMO" in e_date else "?뙔 ?ν썑" if "AMC" in e_date else ""
-                        msg = f"?뱟 *{t} ?ㅼ쟻 諛쒗몴*\n?뿎截??쇱떆: `{clean_date}` {time_icon}\n?뱄툘 異쒖쿂: Finviz"
+                        time_icon = "☀️ 장전" if "BMO" in e_date else "🌙 장후" if "AMC" in e_date else ""
+                        msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{clean_date}` {time_icon}\nℹ️ 출처: Finviz"
                     if not msg:
                         stock = yf.Ticker(t)
                         try:
@@ -341,17 +324,17 @@ def start_background_worker():
                             if dates is not None and not dates.empty:
                                 if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
                                 target = dates.index[0]
-                                msg = f"?뱟 *{t} ?ㅼ쟻 諛쒗몴*\n?뿎截??쇱떆: `{target.strftime('%Y-%m-%d')}`\n(Yfinance)"
+                                msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{target.strftime('%Y-%m-%d')}`\n(Yfinance)"
                         except: pass
                     if msg: bot.reply_to(m, msg, parse_mode='Markdown')
-                    else: bot.reply_to(m, f"??{t}: ?뺣낫 ?놁쓬.")
-                except: bot.reply_to(m, "?ㅻ쪟 諛쒖깮")
+                    else: bot.reply_to(m, f"❌ {t}: 정보 없음.")
+                except: bot.reply_to(m, "오류 발생")
 
-            @bot.message_handler(commands=['summary', '?붿빟'])
+            @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
                 try:
                     parts = m.text.split()
-                    if len(parts) < 2: return bot.reply_to(m, "?ъ슜踰? /summary [?곗빱]")
+                    if len(parts) < 2: return bot.reply_to(m, "사용법: /summary [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     d = get_finviz_data(t)
@@ -363,21 +346,21 @@ def start_background_worker():
                     pe = d.get('P/E', 'N/A'); pbr = d.get('P/B', 'N/A')
                     cap = d.get('Market Cap', 'N/A'); target = d.get('Target Price', 'N/A')
                     if cap == 'N/A' and mkt_cap_y: cap = f"${mkt_cap_y/1e9:.2f}B"
-                    msg = (f"?뱤 *{t} ?щТ ?붿빟*\n?뮥 ?꾩옱媛: `${price}`\n?룫 ?쒓?珥앹븸: `{cap}`\n?뱢 PER: `{pe}`\n?뱴 PBR: `{pbr}`\n?렞 紐⑺몴二쇨?: `${target}`")
+                    msg = (f"📊 *{t} 재무 요약*\n💰 현재가: `${price}`\n🏢 시가총액: `{cap}`\n📈 PER: `{pe}`\n📚 PBR: `{pbr}`\n🎯 목표주가: `${target}`")
                     bot.reply_to(m, msg, parse_mode='Markdown')
-                except: bot.reply_to(m, "?ㅻ쪟 諛쒖깮")
+                except: bot.reply_to(m, "오류 발생")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
                 try:
                     bot.send_chat_action(m.chat.id, 'typing')
                     events = get_economic_events()
-                    if not events: return bot.reply_to(m, "???쇱젙 ?놁쓬")
-                    msg = "?뱟 *二쇱슂 寃쎌젣 ?쇱젙 (USD)*\n????????????????"
+                    if not events: return bot.reply_to(m, "❌ 일정 없음")
+                    msg = "📅 *주요 경제 일정 (USD)*\n────────────────"
                     c=0
                     for e in events:
-                        icon = "?뵦" if e['impact'] == 'High' else "?뵺"
-                        fcst = f"(?덉긽:{e['forecast']})" if e['forecast'] else ""
+                        icon = "🔥" if e['impact'] == 'High' else "🔸"
+                        fcst = f"(예상:{e['forecast']})" if e['forecast'] else ""
                         msg += f"\n{icon} `{e['date']} {e['time']}`\n*{e['event']}* {fcst}\n"
                         c+=1
                         if c>=15: break
@@ -389,10 +372,9 @@ def start_background_worker():
                 try:
                     t = m.text.split()[1].upper()
                     items = get_integrated_news(t, False)
-                    if not items: return bot.reply_to(m, "?댁뒪 ?놁쓬")
-                    msg = [f"?벐 *{t} News (理쒖떊)*"]
-                    for i in items[:5]: # 紐낅졊?대줈 ?몄텧?쒖뿉??5媛쒓퉴吏 蹂댁뿬以?
-                        msg.append(f"?わ툘 `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
+                    if not items: return bot.reply_to(m, "뉴스 없음")
+                    msg = [f"📰 *{t} News*"]
+                    for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
                     bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
                 except: pass
 
@@ -402,48 +384,47 @@ def start_background_worker():
                     t = m.text.split()[1].upper()
                     items = get_integrated_news(t, True)
                     if items:
-                        msg = [f"?룢截?*{t} SEC*"]
-                        for i in items[:5]: 
-                            msg.append(f"?わ툘 `[{i['date']}]` [{i['title'].replace('?룢截?','').replace('[','').replace(']','')}]({i['link']})")
+                        msg = [f"🏛️ *{t} SEC*"]
+                        for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('🏛️ ','').replace('[','').replace(']','')}]({i['link']})")
                         bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
-                    else: bot.reply_to(m, f"??{t} 怨듭떆 ?놁쓬")
+                    else: bot.reply_to(m, f"❌ {t} 공시 없음")
                 except: pass
 
             @bot.message_handler(commands=['p'])
             def p_cmd(m):
-                try: bot.reply_to(m, f"?뮥 *{m.text.split()[1].upper()}*: `${yf.Ticker(m.text.split()[1].upper()).fast_info.last_price:.2f}`", parse_mode='Markdown')
+                try: bot.reply_to(m, f"💰 *{m.text.split()[1].upper()}*: `${yf.Ticker(m.text.split()[1].upper()).fast_info.last_price:.2f}`", parse_mode='Markdown')
                 except: pass
 
             @bot.message_handler(commands=['list'])
             def list_cmd(m):
-                try: c = load_config(); bot.reply_to(m, f"?뱥 紐⑸줉: {', '.join(c['tickers'].keys())}")
+                try: c = load_config(); bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
                 except: pass
 
             @bot.message_handler(commands=['add'])
             def add_cmd(m):
                 try:
                     t = m.text.split()[1].upper(); c = load_config()
-                    if t not in c['tickers']: c['tickers'][t] = DEFAULT_OPTS.copy(); save_config(c); bot.reply_to(m, f"??{t} 異붽???)
+                    if t not in c['tickers']: c['tickers'][t] = DEFAULT_OPTS.copy(); save_config(c); bot.reply_to(m, f"✅ {t} 추가됨")
                 except: pass
 
             @bot.message_handler(commands=['del'])
             def del_cmd(m):
                 try:
                     t = m.text.split()[1].upper(); c = load_config()
-                    if t in c['tickers']: del c['tickers'][t]; save_config(c); bot.reply_to(m, f"?뿊截?{t} ??젣??)
+                    if t in c['tickers']: del c['tickers'][t]; save_config(c); bot.reply_to(m, f"🗑️ {t} 삭제됨")
                 except: pass
 
             @bot.message_handler(commands=['ping'])
-            def ping_cmd(m): bot.reply_to(m, "?룗 Pong! ?뺤긽.")
+            def ping_cmd(m): bot.reply_to(m, "🏓 Pong! 정상.")
 
             try:
                 bot.set_my_commands([
-                    BotCommand("eco", "?뱟 寃쎌젣吏??), BotCommand("earning", "?뮥 ?ㅼ쟻 諛쒗몴"),
-                    BotCommand("news", "?벐 ?댁뒪"), BotCommand("summary", "?뱤 ?붿빟"),
-                    BotCommand("p", "?뮥 ?꾩옱媛"), BotCommand("sec", "?룢截?怨듭떆"),
-                    BotCommand("ping", "?룗 ?앹〈?뺤씤"), BotCommand("list", "?뱥 紐⑸줉"),
-                    BotCommand("on", "?윟 媛??), BotCommand("off", "???뺤?"),
-                    BotCommand("add", "??異붽?"), BotCommand("del", "?뿊截???젣")
+                    BotCommand("eco", "📅 경제지표"), BotCommand("earning", "💰 실적 발표"),
+                    BotCommand("news", "📰 뉴스"), BotCommand("summary", "📊 요약"),
+                    BotCommand("p", "💰 현재가"), BotCommand("sec", "🏛️ 공시"),
+                    BotCommand("ping", "🏓 생존확인"), BotCommand("list", "📋 목록"),
+                    BotCommand("on", "🟢 가동"), BotCommand("off", "⛔ 정지"),
+                    BotCommand("add", "➕ 추가"), BotCommand("del", "🗑️ 삭제")
                 ])
             except: pass
 
@@ -457,18 +438,18 @@ def start_background_worker():
                             if now.weekday() == 0 and now.hour == 8 and last_weekly_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 if events:
-                                    msg = "?뱟 *?대쾲 二?二쇱슂 寃쎌젣 ?쇱젙*\n????????????????"
+                                    msg = "📅 *이번 주 주요 경제 일정*\n────────────────"
                                     c=0
                                     for e in events:
-                                        if e['impact'] == 'High': msg += f"\n?뿎截?`{e['date']} {e['time']}`\n?뵦 {e['event']}"; c+=1
+                                        if e['impact'] == 'High': msg += f"\n🗓️ `{e['date']} {e['time']}`\n🔥 {e['event']}"; c+=1
                                     if c>0: bot.send_message(chat_id, msg, parse_mode='Markdown'); last_weekly_sent = now.strftime('%Y-%m-%d')
                             if now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 events = get_economic_events()
                                 today = datetime.now().strftime('%Y-%m-%d')
                                 todays = [e for e in events if e['date'] == today]
                                 if todays:
-                                    msg = f"?截?*?ㅻ뒛({today}) 二쇱슂 ?쇱젙*\n????????????????"
-                                    for e in todays: msg += f"\n??{e['time']} : {e['event']} (?덉긽:{e['forecast']})"
+                                    msg = f"☀️ *오늘({today}) 주요 일정*\n────────────────"
+                                    for e in todays: msg += f"\n⏰ {e['time']} : {e['event']} (예상:{e['forecast']})"
                                     bot.send_message(chat_id, msg, parse_mode='Markdown'); last_daily_sent = now.strftime('%Y-%m-%d')
 
                         if cfg.get('system_active', True) and cfg['tickers']:
@@ -479,48 +460,37 @@ def start_background_worker():
                     time.sleep(60)
 
             def analyze_ticker(ticker, settings, token, chat_id):
-                if not settings.get('?윟 媛먯떆', True): return
+                # 구버전 키 방지 (마이그레이션된 키 사용)
+                if not settings.get('🟢 감시', True): return
                 try:
-                    # 1. ?댁뒪 諛?怨듭떆 (Flooding 諛⑹? 濡쒖쭅 ?곸슜)
-                    if settings.get('?벐 ?댁뒪') or settings.get('?룢截?SEC'):
+                    # 뉴스
+                    if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         current_config = load_config()
                         history = current_config.get('news_history', {})
                         if ticker not in history: history[ticker] = []
                         
                         items = get_integrated_news(ticker, False)
                         updated = False
-                        sent_count_this_cycle = 0 # ?대쾲 ?ъ씠?댁뿉 蹂대궦 ?댁뒪 媛쒖닔
                         
-                        # items???대? ?좎쭨 理쒖떊?쒖쑝濡??뺣젹?섏뼱 ?덉쓬 (?띾낫 ?곗꽑)
                         for item in items:
-                            # ?대? 蹂대궦 ?댁뒪?몄? ?뺤씤 (Hash Key ?ъ슜: ?쒕ぉ+?좎쭨)
-                            if item['hash'] in history[ticker] or item['link'] in history[ticker]: continue
+                            if item['link'] in history[ticker]: continue
                             
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
-                            should_send = (is_sec and settings.get('?룢截?SEC')) or (not is_sec and settings.get('?벐 ?댁뒪'))
+                            should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
                             
                             if should_send:
-                                prefix = "?룢截? if is_sec else "?벐"
-                                try:
-                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"?뵒 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-                                except: pass
+                                prefix = "🏛️" if is_sec else "📰"
+                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
                                 
-                                # ?덉뒪?좊━??Hash 異붽? (以묐났 諛⑹?)
-                                history[ticker].append(item['hash'])
-                                if len(history[ticker]) > 50: history[ticker].pop(0) # ?덉뒪?좊━ 愿由?
+                                history[ticker].append(item['link'])
+                                if len(history[ticker]) > 30: history[ticker].pop(0)
                                 updated = True
-                                sent_count_this_cycle += 1
-                            
-                            # [?듭떖] ???ъ씠????60珥???1媛쒕쭔 諛쒖넚?섍퀬 猷⑦봽 醫낅즺 -> ??깂 諛⑹?
-                            if sent_count_this_cycle >= 1: 
-                                break 
-
                         if updated:
                             current_config['news_history'] = history
                             save_config(current_config)
 
-                    # 2. 媛寃?(3%)
-                    if settings.get('?뱢 湲됰벑??3%)'):
+                    # 가격 (3%)
+                    if settings.get('📈 급등락(3%)'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
                         if not h.empty:
@@ -529,17 +499,17 @@ def start_background_worker():
                             if abs(pct) >= 3.0:
                                 last = price_alert_cache.get(ticker, 0)
                                 if abs(pct - last) >= 1.0:
-                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"?뵒 *[{ticker}] {'湲됰벑 ??' if pct>0 else '湲됰씫 ?뱣'}*\n蹂?? {pct:.2f}%\n?꾩옱: ${curr:.2f}", "parse_mode": "Markdown"})
+                                    requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 *[{ticker}] {'급등 🚀' if pct>0 else '급락 📉'}*\n변동: {pct:.2f}%\n현재: ${curr:.2f}", "parse_mode": "Markdown"})
                                     price_alert_cache[ticker] = pct
-                    # 3. RSI
-                    if settings.get('?뱣 RSI'):
+                    # RSI
+                    if settings.get('📉 RSI'):
                         h = stock.history(period="1mo")
                         if not h.empty:
                             delta = h['Close'].diff(); gain = (delta.where(delta > 0, 0)).rolling(14).mean(); loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
                             rs = gain / loss; rsi = 100 - (100 / (1 + rs)).iloc[-1]
                             status = rsi_alert_status.get(ticker, "NORMAL")
-                            if rsi >= 70 and status != "OB": requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"?뵦 [{ticker}] RSI 怨쇰ℓ??({rsi:.1f})"}); rsi_alert_status[ticker] = "OB"
-                            elif rsi <= 30 and status != "OS": requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"?뮛 [{ticker}] RSI 怨쇰ℓ??({rsi:.1f})"}); rsi_alert_status[ticker] = "OS"
+                            if rsi >= 70 and status != "OB": requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔥 [{ticker}] RSI 과매수 ({rsi:.1f})"}); rsi_alert_status[ticker] = "OB"
+                            elif rsi <= 30 and status != "OS": requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"💧 [{ticker}] RSI 과매도 ({rsi:.1f})"}); rsi_alert_status[ticker] = "OS"
                             elif 35 < rsi < 65: rsi_alert_status[ticker] = "NORMAL"
                 except: pass
 
@@ -560,7 +530,7 @@ start_background_worker()
 # ---------------------------------------------------------
 # [4] UI
 # ---------------------------------------------------------
-st.set_page_config(page_title="DeBrief", layout="wide", page_icon="?뱻")
+st.set_page_config(page_title="DeBrief", layout="wide", page_icon="📡")
 st.markdown("""<style>
     .stApp { background-color: #FFFFFF; color: #202124; }
     .stock-card { background-color: #FFFFFF; border: 1px solid #DADCE0; border-radius: 8px; padding: 8px 5px; margin-bottom: 6px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
@@ -572,24 +542,24 @@ st.markdown("""<style>
 config = load_config()
 
 with st.sidebar:
-    st.header("?럾截?Control Panel")
-    if "jsonbin" in st.secrets: st.success("?곻툘 Cloud Connected")
+    st.header("🎛️ Control Panel")
+    if "jsonbin" in st.secrets: st.success("☁️ Cloud Connected")
     
     if st.toggle("System Power", value=config.get('system_active', True)):
-        st.success("?윟 Active"); config['system_active'] = True
+        st.success("🟢 Active"); config['system_active'] = True
     else:
-        st.error("??Paused"); config['system_active'] = False
+        st.error("⛔ Paused"); config['system_active'] = False
     save_config(config)
 
-    with st.expander("?뵎 Keys"):
+    with st.expander("🔑 Keys"):
         bot_t = st.text_input("Bot Token", value=config['telegram'].get('bot_token', ''), type="password")
         chat_i = st.text_input("Chat ID", value=config['telegram'].get('chat_id', ''))
         if st.button("Save Keys"):
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>?뱻 DeBrief Cloud (V56)</h3>", unsafe_allow_html=True)
-t1, t2, t3 = st.tabs(["?뱤 Dashboard", "?숋툘 Management", "?뱶 Logs"])
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V55)</h3>", unsafe_allow_html=True)
+t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
     if config['tickers'] and config['system_active']:
@@ -605,25 +575,26 @@ with t1:
             except: pass
 
 with t2:
-    st.markdown("#### ?뱼 ?뚮┝ ?ㅼ젙")
-    eco_mode = st.checkbox("?뱼 寃쎌젣吏???곗? ?뚮┝", value=config.get('eco_mode', True))
+    st.markdown("#### 📢 알림 설정")
+    eco_mode = st.checkbox("📢 경제지표/연준 알림", value=config.get('eco_mode', True))
     if eco_mode != config.get('eco_mode', True):
-        config['eco_mode'] = eco_mode; save_config(config); st.toast("??λ맖")
+        config['eco_mode'] = eco_mode; save_config(config); st.toast("저장됨")
 
     st.divider()
     c_all_1, c_all_2, c_blank = st.columns([1, 1, 3])
-    if c_all_1.button("??ALL ON", use_container_width=True):
+    # [수정] ALL ON 버튼 로직 개선
+    if c_all_1.button("✅ ALL ON", use_container_width=True):
         for t in config['tickers']:
             for k in config['tickers'][t]: config['tickers'][t][k] = True
         save_config(config); st.rerun()
         
-    if c_all_2.button("??ALL OFF", use_container_width=True):
+    if c_all_2.button("⛔ ALL OFF", use_container_width=True):
         for t in config['tickers']:
             for k in config['tickers'][t]: config['tickers'][t][k] = False
         save_config(config); st.rerun()
 
     input_t = st.text_input("Add Tickers")
-    if st.button("??Add"):
+    if st.button("➕ Add"):
         for t in [x.strip().upper() for x in input_t.split(',') if x.strip()]:
             config['tickers'][t] = DEFAULT_OPTS.copy()
         save_config(config); st.rerun()
@@ -637,8 +608,8 @@ with t2:
             
     st.divider()
     del_cols = st.columns([4, 1])
-    del_target = del_cols[0].selectbox("??젣??醫낅ぉ ?좏깮", options=list(config['tickers'].keys()))
-    if del_cols[1].button("??젣"):
+    del_target = del_cols[0].selectbox("삭제할 종목 선택", options=list(config['tickers'].keys()))
+    if del_cols[1].button("삭제"):
         if del_target in config['tickers']: del config['tickers'][del_target]; save_config(config); st.rerun()
 
 with t3:
