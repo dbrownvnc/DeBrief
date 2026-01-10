@@ -474,8 +474,9 @@ with t2:
     
     # 종목 추가
     st.markdown("#### ➕ 종목 추가")
-    input_t = st.text_input("Add Tickers (쉼표로 구분)", key='add_ticker_input')
-    if st.button("➕ Add", key='add_ticker_btn'):
+    col_add1, col_add2 = st.columns([4, 1])
+    input_t = col_add1.text_input("종목 추가 (쉼표로 구분)", key='add_ticker_input', label_visibility='collapsed', placeholder='AAPL, MSFT, GOOGL')
+    if col_add2.button("➕ Add", key='add_ticker_btn', use_container_width=True):
         added = []
         for t in [x.strip().upper() for x in input_t.split(',') if x.strip()]:
             if t not in config['tickers']:
@@ -483,8 +484,8 @@ with t2:
                 added.append(t)
         if added:
             save_config(config)
-            st.success(f"추가됨: {', '.join(added)}")
-            time.sleep(1)
+            st.success(f"추가: {', '.join(added)}")
+            time.sleep(0.5)
             st.rerun()
     
     st.divider()
@@ -492,65 +493,86 @@ with t2:
     # 일괄 설정
     st.markdown("#### 🎛️ 일괄 설정")
     c_all_1, c_all_2 = st.columns(2)
-    if c_all_1.button("✅ 전체 켜기", use_container_width=True, key='all_on_btn'):
+    if c_all_1.button("✅ 전체 ON", use_container_width=True, key='all_on_btn'):
         for t in config['tickers']:
             for k in config['tickers'][t]: 
                 config['tickers'][t][k] = True
         save_config(config)
         st.success("모든 알림 활성화!")
-        time.sleep(1)
+        time.sleep(0.5)
         st.rerun()
         
-    if c_all_2.button("⛔ 전체 끄기", use_container_width=True, key='all_off_btn'):
+    if c_all_2.button("⛔ 전체 OFF", use_container_width=True, key='all_off_btn'):
         for t in config['tickers']:
             for k in config['tickers'][t]: 
                 config['tickers'][t][k] = False
         save_config(config)
         st.warning("모든 알림 비활성화!")
-        time.sleep(1)
+        time.sleep(0.5)
         st.rerun()
     
     st.divider()
     
-    # 개별 종목 설정 (체크박스로 변경)
-    st.markdown("#### 📋 종목별 알림 설정")
+    # 항목별 일괄 제어 체크박스
+    st.markdown("#### 🎚️ 항목별 전체 제어")
+    option_keys = list(DEFAULT_OPTS.keys())
+    
+    # 각 항목별로 체크박스 생성 (2열 구조)
+    col_opt1, col_opt2 = st.columns(2)
+    for i, opt in enumerate(option_keys):
+        # 현재 모든 티커의 해당 항목 상태 확인
+        all_on = all(config['tickers'][t].get(opt, False) for t in config['tickers']) if config['tickers'] else False
+        
+        if i % 2 == 0:
+            toggled = col_opt1.checkbox(f"**{opt}** (전체)", value=all_on, key=f"toggle_all_{opt}")
+        else:
+            toggled = col_opt2.checkbox(f"**{opt}** (전체)", value=all_on, key=f"toggle_all_{opt}")
+        
+        # 상태가 변경되었는지 확인
+        if toggled != all_on:
+            # 모든 티커의 해당 항목을 변경
+            for ticker in config['tickers']:
+                config['tickers'][ticker][opt] = toggled
+            save_config(config)
+            st.success(f"{opt} → {'ON' if toggled else 'OFF'} (전체)")
+            time.sleep(0.3)
+            st.rerun()
+    
+    st.divider()
+    
+    # 개별 종목 설정 테이블
+    st.markdown("#### 📋 종목별 상세 설정")
     
     if config['tickers']:
-        for ticker in sorted(config['tickers'].keys()):
-            with st.expander(f"**{ticker}**", expanded=False):
-                settings = config['tickers'][ticker]
-                
-                # 각 옵션별 체크박스
-                col1, col2 = st.columns(2)
-                
-                option_keys = list(DEFAULT_OPTS.keys())
-                changed = False
-                
-                for i, opt in enumerate(option_keys):
-                    current_value = settings.get(opt, DEFAULT_OPTS[opt])
-                    
-                    if i % 2 == 0:
-                        new_value = col1.checkbox(opt, value=current_value, key=f"{ticker}_{opt}")
-                    else:
-                        new_value = col2.checkbox(opt, value=current_value, key=f"{ticker}_{opt}")
-                    
-                    if new_value != current_value:
-                        settings[opt] = new_value
-                        changed = True
-                
-                # 삭제 버튼
-                if st.button(f"🗑️ {ticker} 삭제", key=f"delete_{ticker}", type="secondary"):
-                    del config['tickers'][ticker]
-                    save_config(config)
-                    st.warning(f"{ticker} 삭제됨")
-                    time.sleep(1)
-                    st.rerun()
-                
-                # 변경사항이 있을 때만 저장
-                if changed:
-                    config['tickers'][ticker] = settings
-                    save_config(config)
-                    st.success(f"{ticker} 설정 저장됨")
+        df = pd.DataFrame(config['tickers']).T
+        
+        # data_editor 사용 (변경 감지 개선)
+        edited = st.data_editor(
+            df, 
+            use_container_width=True,
+            hide_index=False,
+            key='ticker_editor'
+        )
+        
+        # 변경사항이 있을 때만 저장
+        if not df.equals(edited):
+            config['tickers'] = edited.to_dict(orient='index')
+            save_config(config)
+            st.toast("✅ 저장됨", icon="✅")
+    
+    st.divider()
+    
+    # 종목 삭제
+    st.markdown("#### 🗑️ 종목 삭제")
+    del_cols = st.columns([4, 1])
+    del_target = del_cols[0].selectbox("삭제할 종목", options=list(config['tickers'].keys()) if config['tickers'] else [], key='delete_select')
+    if del_cols[1].button("🗑️ 삭제", key='delete_btn', use_container_width=True):
+        if del_target and del_target in config['tickers']:
+            del config['tickers'][del_target]
+            save_config(config)
+            st.warning(f"{del_target} 삭제됨")
+            time.sleep(0.5)
+            st.rerun()
 
 with t3:
     st.markdown("#### 📜 최근 로그")
