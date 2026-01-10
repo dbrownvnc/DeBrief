@@ -19,10 +19,10 @@ from deep_translator import GoogleTranslator
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
 
-# [State] 캐시 및 전역 변수 초기화
+# [State] 전역 캐시 및 세션 초기화
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
-# [핵심] 설정을 메모리에 유지하기 위한 세션 스테이트
+# [핵심] UI 깜빡임 방지를 위한 임시 설정 저장소
 if 'app_config' not in st.session_state: st.session_state['app_config'] = None
 if 'unsaved_changes' not in st.session_state: st.session_state['unsaved_changes'] = False
 
@@ -34,7 +34,7 @@ EXCLUDED_KEYWORDS = ['casino', 'sport', 'baseball', 'football', 'soccer', 'lotto
                      '카지노', '스포츠', '야구', '축구', '로또', '운세', '연예']
 
 # ---------------------------------------------------------
-# [0] 로그 및 유틸
+# [0] 유틸리티
 # ---------------------------------------------------------
 def write_log(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -67,8 +67,8 @@ DEFAULT_OPTS = {
 # ---------------------------------------------------------
 # [1] 설정 로드/저장 (봇/UI 분리)
 # ---------------------------------------------------------
-def load_config_from_disk():
-    """디스크(또는 클라우드)에서 설정을 읽어옵니다."""
+def load_config_direct():
+    """디스크/클라우드에서 직접 로드 (봇용/초기화용)"""
     config = {
         "system_active": True, "eco_mode": True,
         "telegram": {"bot_token": "", "chat_id": ""}, 
@@ -76,33 +76,31 @@ def load_config_from_disk():
         "news_history": {} 
     }
     
-    # 1. Cloud Load
+    # 1. Cloud
     url = get_jsonbin_url(); headers = get_jsonbin_headers()
     loaded_data = None
     if url and headers:
         try:
-            resp = requests.get(f"{url}/latest", headers=headers, timeout=2)
+            resp = requests.get(f"{url}/latest", headers=headers, timeout=3)
             if resp.status_code == 200: loaded_data = resp.json()['record']
         except: pass
     
-    # 2. Local Load
+    # 2. Local
     if not loaded_data and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f: loaded_data = json.load(f)
         except: pass
 
     if loaded_data:
-        # 병합 로직
-        for key in ['system_active', 'eco_mode', 'telegram', 'news_history', 'tickers']:
-            if key in loaded_data: config[key] = loaded_data[key]
-            
-    # 티커 옵션 마이그레이션 (구버전 호환)
+        for k in ['system_active', 'eco_mode', 'telegram', 'news_history', 'tickers']:
+            if k in loaded_data: config[k] = loaded_data[k]
+
+    # 옵션 마이그레이션
     for t, opts in config['tickers'].items():
-        # 누락된 키 채워넣기
         for def_k, def_v in DEFAULT_OPTS.items():
             if def_k not in opts: config['tickers'][t][def_k] = def_v
-
-    # Secrets 덮어쓰기
+            
+    # Secrets 우선 적용
     try:
         if "telegram" in st.secrets:
             config['telegram']['bot_token'] = st.secrets["telegram"]["bot_token"]
@@ -111,8 +109,8 @@ def load_config_from_disk():
     
     return config
 
-def save_config_to_disk(config):
-    """설정을 디스크(또는 클라우드)에 저장합니다."""
+def save_config_direct(config):
+    """디스크/클라우드에 직접 저장"""
     url = get_jsonbin_url(); headers = get_jsonbin_headers()
     if url and headers:
         try: requests.put(url, headers=headers, json=config, timeout=3)
@@ -139,15 +137,16 @@ def get_integrated_news(ticker, is_sec_search=False):
 
     def fetch(url):
         try:
-            response = requests.get(url, headers=headers, timeout=2)
+            response = requests.get(url, headers=headers, timeout=2) # 타임아웃 단축
             root = ET.fromstring(response.content)
-            for item in root.findall('.//item')[:3]: # 속도 최적화를 위해 상위 3개만
+            for item in root.findall('.//item')[:3]: # RSS당 3개만
                 try:
                     raw_title = item.find('title').text.split(' - ')[0]
                     link = item.find('link').text
                     pubDate = item.find('pubDate').text
                     
                     if any(bad in raw_title.lower() for bad in EXCLUDED_KEYWORDS): continue
+                    
                     dt_obj = None
                     try: dt_obj = datetime.strptime(pubDate.replace(' GMT', ''), '%a, %d %b %Y %H:%M:%S')
                     except: pass
@@ -159,9 +158,8 @@ def get_integrated_news(ticker, is_sec_search=False):
                     seen_titles.add(raw_title)
 
                     title_ko = raw_title
-                    # 한글 번역 (필요시에만)
                     if not any("\u3131" <= char <= "\u3163" or "\uac00" <= char <= "\ud7a3" for char in raw_title):
-                        try: title_ko = translator.translate(raw_title[:120]) 
+                        try: title_ko = translator.translate(raw_title[:100]) 
                         except: pass
                     
                     prefix = "🏛️" if is_sec_search else "📰"
@@ -181,7 +179,7 @@ def get_economic_events():
     try:
         scraper = cloudscraper.create_scraper()
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        resp = scraper.get(url, timeout=3)
+        resp = scraper.get(url, timeout=5)
         if resp.status_code != 200: return []
         root = ET.fromstring(resp.content)
         events = []
@@ -202,7 +200,7 @@ def get_economic_events():
     except: return []
 
 # ---------------------------------------------------------
-# [3] 백그라운드 봇 (UI 간섭 최소화)
+# [3] 백그라운드 봇
 # ---------------------------------------------------------
 @st.cache_resource
 def start_background_worker():
@@ -211,44 +209,43 @@ def start_background_worker():
 
     def run_bot_system():
         time.sleep(3)
-        write_log("🤖 봇 시스템 시작")
+        write_log("🤖 봇 스레드 시작")
         
         while True:
             try:
-                # 설정 로드 (봇은 항상 최신 파일 기준)
-                cfg = load_config_from_disk()
+                # 봇은 항상 최신 파일 설정 로드
+                cfg = load_config_direct()
                 token = cfg['telegram']['bot_token']
                 chat_id = cfg['telegram']['chat_id']
                 
-                if not token: 
+                if not token or not chat_id:
                     time.sleep(10); continue
                 
                 bot = telebot.TeleBot(token)
                 
-                # 봇 명령어 핸들러 (생략없이 필수 기능만 포함)
+                # 명령어 핸들러
                 @bot.message_handler(commands=['ping'])
                 def ping(m): bot.reply_to(m, "🏓 Pong! (System OK)")
-
+                
                 @bot.message_handler(commands=['eco'])
                 def eco(m):
                     evts = get_economic_events()
                     if not evts: return bot.reply_to(m, "일정 없음")
-                    msg = "📅 *주요 경제 일정*\n"
-                    for e in evts[:8]: msg += f"▪️ {e['date']} {e['time']} | {e['event']}\n"
+                    msg = "📅 *주요 경제 일정*\n" + "\n".join([f"▪️ {e['date']} {e['time']} | {e['event']}" for e in evts[:8]])
                     bot.reply_to(m, msg, parse_mode='Markdown')
 
-                # 모니터링 루프
+                # 모니터링 로직
                 def monitor():
                     last_daily_sent = None
                     while True:
                         try:
-                            # 1. 봇 전용 설정 읽기 (읽기 전용)
-                            curr_cfg = load_config_from_disk()
+                            # 1. 설정 새로 읽기 (매 루프)
+                            curr_cfg = load_config_direct()
                             
                             if not curr_cfg.get('system_active', True):
                                 time.sleep(60); continue
 
-                            # 경제지표 (매일 아침 8시)
+                            # 2. 경제지표 (매일 08시)
                             now = datetime.now()
                             if curr_cfg.get('eco_mode', True) and now.hour == 8 and last_daily_sent != now.strftime('%Y-%m-%d'):
                                 evts = get_economic_events()
@@ -259,14 +256,14 @@ def start_background_worker():
                                     bot.send_message(chat_id, msg, parse_mode='Markdown')
                                     last_daily_sent = today
 
-                            # 티커 감시
+                            # 3. 티커 감시
                             if curr_cfg['tickers']:
                                 with ThreadPoolExecutor(max_workers=2) as exe:
                                     for t, s in curr_cfg['tickers'].items():
                                         exe.submit(check_ticker, t, s, token, chat_id)
                                         
-                        except Exception as e: write_log(f"Loop Err: {e}")
-                        time.sleep(60)
+                        except Exception as e: write_log(f"Loop Error: {e}")
+                        time.sleep(60) # 1분 주기
 
                 def check_ticker(ticker, settings, token, chat_id):
                     if not settings.get('🟢 감시', True): return
@@ -274,8 +271,8 @@ def start_background_worker():
                     # [뉴스 감시]
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         try:
-                            # 파일에서 직접 히스토리만 읽음 (UI 설정 덮어쓰기 방지)
-                            fresh_cfg = load_config_from_disk()
+                            # 히스토리는 파일에서 직접 최신본을 가져옴 (UI 설정 덮어쓰기 방지)
+                            fresh_cfg = load_config_direct()
                             history = fresh_cfg.get('news_history', {})
                             if ticker not in history: history[ticker] = []
                             
@@ -284,6 +281,7 @@ def start_background_worker():
                             
                             for item in items:
                                 if item['hash'] in history[ticker]: continue
+                                
                                 is_sec = item['is_sec']
                                 if (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스')):
                                     try:
@@ -293,14 +291,14 @@ def start_background_worker():
                                     history[ticker].append(item['hash'])
                                     if len(history[ticker]) > 50: history[ticker].pop(0)
                                     updated = True
-                                    break # 1회 1뉴스 제한
+                                    break # 루프당 1개만 발송 (스팸 방지)
 
                             if updated:
-                                # 저장 시점: 파일을 다시 읽어서 'news_history' 부분만 교체하고 저장
-                                # 이렇게 하면 사용자가 UI에서 바꾸고 있는 설정을 건드리지 않음
-                                final_cfg = load_config_from_disk()
+                                # 저장 시점: 다시 한번 파일을 읽어서 'news_history'만 교체하고 저장
+                                # UI에서 변경 중인 설정을 덮어쓰지 않기 위함
+                                final_cfg = load_config_direct()
                                 final_cfg['news_history'] = history
-                                save_config_to_disk(final_cfg)
+                                save_config_direct(final_cfg)
                         except: pass
 
                     # [가격 감시]
@@ -321,7 +319,7 @@ def start_background_worker():
                 t_mon = threading.Thread(target=monitor, daemon=True)
                 t_mon.start()
                 
-                bot.infinity_polling()
+                bot.infinity_polling(timeout=10, long_polling_timeout=5)
             except Exception as e:
                 write_log(f"Bot Crash: {e}")
                 time.sleep(10)
@@ -332,7 +330,7 @@ def start_background_worker():
 start_background_worker()
 
 # ---------------------------------------------------------
-# [4] UI (성능 최적화 및 깜빡임 방지)
+# [4] UI (성능 최적화 & 깜빡임 방지)
 # ---------------------------------------------------------
 st.set_page_config(page_title="DeBrief Cloud", layout="wide", page_icon="📡")
 st.markdown("""<style>
@@ -344,48 +342,56 @@ st.markdown("""<style>
     .stButton button { width: 100%; }
 </style>""", unsafe_allow_html=True)
 
-# 1. 초기 로드 (앱 켤 때 한 번만 디스크에서 읽음)
+# 초기 로드 (앱 시작 시 1회만 디스크 읽기)
 if st.session_state['app_config'] is None:
-    st.session_state['app_config'] = load_config_from_disk()
+    st.session_state['app_config'] = load_config_direct()
 
-# 편의상 변수 바인딩 (참조)
+# UI는 세션 스테이트(메모리)만 조작함
 config = st.session_state['app_config']
 
 with st.sidebar:
     st.header("🎛️ 제어판")
     
-    # 시스템 전원 (즉시 저장)
+    # 시스템 전원 (중요하므로 즉시 저장)
     sys_active = st.toggle("시스템 전원", value=config.get('system_active', True))
     if sys_active != config.get('system_active', True):
         config['system_active'] = sys_active
-        save_config_to_disk(config) # 중요 설정은 즉시 저장
-        st.toast("시스템 상태 변경됨")
+        save_config_direct(config)
+        st.rerun()
 
-    with st.expander("🔑 봇 설정"):
+    with st.expander("🔑 봇 설정 (수정 후 저장 필수)"):
         token = st.text_input("Bot Token", value=config['telegram'].get('bot_token', ''), type="password")
         chatid = st.text_input("Chat ID", value=config['telegram'].get('chat_id', ''))
+        
+        # [테스트 버튼 추가] 알림 안 온다면 이것부터 확인
+        if st.button("🔔 테스트 알림 발송"):
+            if token and chatid:
+                try:
+                    res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chatid, "text": "🔔 테스트 알림입니다. 봇이 정상 작동 중입니다."})
+                    if res.status_code == 200: st.toast("✅ 발송 성공!")
+                    else: st.error(f"❌ 발송 실패: {res.text}")
+                except Exception as e: st.error(f"오류: {e}")
+            else: st.warning("토큰과 Chat ID를 입력하세요.")
+
         if st.button("설정 저장"):
             config['telegram']['bot_token'] = token
             config['telegram']['chat_id'] = chatid
-            save_config_to_disk(config)
-            st.rerun()
+            save_config_direct(config)
+            st.success("저장됨")
 
 st.title("📡 DeBrief Cloud (V57 Stable)")
 t1, t2, t3 = st.tabs(["📊 대시보드", "⚙️ 감시 관리", "📜 로그"])
 
 with t1:
     if config['tickers']:
-        # 시세 조회는 렉 유발 가능성이 있으므로 예외처리 강화
         cols = st.columns(6)
         for i, (t, _) in enumerate(config['tickers'].items()):
             try:
-                # 퀵하게 정보만 가져옴
-                # yfinance 느릴 경우를 대비해 예외처리
+                # 빠른 로딩을 위해 퀵 인포 사용
                 info = yf.Ticker(t).fast_info
                 p = info.last_price
                 if p:
-                    prev = info.previous_close
-                    chg = ((p - prev)/prev)*100
+                    chg = ((p - info.previous_close)/info.previous_close)*100
                     color_class = "up-txt" if chg >= 0 else "down-txt"
                     with cols[i % 6]:
                         st.markdown(f"""<div class="stock-card"><div class="stock-symbol">{t}</div>
@@ -395,73 +401,72 @@ with t1:
         st.info("등록된 종목이 없습니다.")
 
 with t2:
-    st.info("💡 설정을 변경한 후 반드시 하단의 **[💾 설정 저장하기]** 버튼을 눌러야 반영됩니다. (깜빡임 방지)")
+    st.info("💡 **[참고]** 설정을 변경한 후 하단의 **[💾 설정 저장하기]** 버튼을 눌러야 봇에 반영됩니다.")
 
-    # 1. 일괄 제어 (Session State 조작)
+    # 1. 항목별 일괄 제어 (버튼 방식 - 빠름)
     if config['tickers']:
         first_keys = list(next(iter(config['tickers'].values())).keys())
-        
-        # 버튼으로 일괄 제어 (체크박스보다 반응 빠름)
         st.markdown("**항목별 전체 켜기/끄기**")
+        
+        # 버튼 배열
         cols = st.columns(len(first_keys))
         for idx, key in enumerate(first_keys):
-            if cols[idx].button(f"{key}", use_container_width=True, key=f"btn_{key}"):
-                # 현재 상태 확인 (하나라도 켜져있으면 -> 끈다)
-                any_true = any(config['tickers'][t].get(key, False) for t in config['tickers'])
-                target = not any_true
+            # 버튼 클릭 시 -> 메모리 상의 값 일괄 변경 -> 리런 (UI 갱신)
+            if cols[idx].button(f"{key}", key=f"btn_{key}"):
+                # 하나라도 켜져있으면 끄기, 아니면 켜기
+                is_any_on = any(config['tickers'][t].get(key, False) for t in config['tickers'])
+                new_val = not is_any_on
                 for t in config['tickers']:
-                    config['tickers'][t][key] = target
+                    config['tickers'][t][key] = new_val
                 st.session_state['unsaved_changes'] = True
                 st.rerun()
 
-        # 2. 데이터 에디터
+        # 2. 데이터 에디터 (개별 제어)
         df = pd.DataFrame(config['tickers']).T
         df = df[first_keys] # 컬럼 순서 고정
 
-        # 편집 가능한 데이터프레임 표시
         edited_df = st.data_editor(df, use_container_width=True, height=len(df)*35 + 38, key="editor")
 
         # 변경 감지
         if not df.equals(edited_df):
-            # 변경사항을 Session State에 반영 (디스크 저장 X)
-            new_tickers = edited_df.to_dict(orient='index')
-            # 기존 설정 유지하면서 값 업데이트
-            for t in new_tickers:
+            new_data = edited_df.to_dict(orient='index')
+            # 기존 Ticker Dict 업데이트
+            for t in new_data:
                 if t in config['tickers']:
-                    config['tickers'][t].update(new_tickers[t])
+                    config['tickers'][t].update(new_data[t])
             st.session_state['unsaved_changes'] = True
 
-    # 3. 저장 버튼 (여기서만 파일 저장)
+    # 3. 저장 버튼 (수동 저장)
     st.divider()
     save_col, _ = st.columns([1, 4])
     if save_col.button("💾 설정 저장하기 (Save)", type="primary", use_container_width=True):
-        save_config_to_disk(config)
+        save_config_direct(config)
         st.session_state['unsaved_changes'] = False
-        st.success("✅ 모든 설정이 저장되었습니다.")
+        st.success("✅ 설정이 저장되었습니다. 봇이 새 설정을 로드합니다.")
         time.sleep(1)
         st.rerun()
 
     if st.session_state['unsaved_changes']:
-        st.warning("⚠️ 저장되지 않은 변경사항이 있습니다. [저장하기]를 눌러주세요.")
+        st.warning("⚠️ 저장되지 않은 변경사항이 있습니다.")
 
-    # 추가/삭제 (즉시 반영)
+    # 종목 추가/삭제 (구조 변경은 즉시 저장)
     st.markdown("---")
     c1, c2, c3, c4 = st.columns([2, 1, 2, 1])
     
-    new_t = c1.text_input("종목 추가", placeholder="예: TSLA", label_visibility='collapsed')
+    new_t = c1.text_input("종목 추가", placeholder="티커 입력", label_visibility='collapsed')
     if c2.button("➕ 추가", use_container_width=True):
         if new_t:
             targets = [x.strip().upper() for x in new_t.split(',') if x.strip()]
             for t in targets:
                 if t not in config['tickers']: config['tickers'][t] = DEFAULT_OPTS.copy()
-            save_config_to_disk(config) # 추가는 구조 변경이므로 즉시 저장
+            save_config_direct(config)
             st.rerun()
 
-    del_t = c3.selectbox("삭제할 종목", options=list(config['tickers'].keys()) if config['tickers'] else [], label_visibility='collapsed')
+    del_t = c3.selectbox("삭제", options=list(config['tickers'].keys()) if config['tickers'] else [], label_visibility='collapsed')
     if c4.button("🗑️ 삭제", use_container_width=True):
         if del_t in config['tickers']:
             del config['tickers'][del_t]
-            save_config_to_disk(config) # 삭제는 구조 변경이므로 즉시 저장
+            save_config_direct(config)
             st.rerun()
 
 with t3:
