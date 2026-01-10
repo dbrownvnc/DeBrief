@@ -19,10 +19,12 @@ from deep_translator import GoogleTranslator
 CONFIG_FILE = 'debrief_settings.json'
 LOG_FILE = 'debrief.log'
 
-# [State] 캐시 및 전역 변수
+# [State] 캐시 및 전역 변수 초기화
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
 if 'eco_alert_cache' not in st.session_state: st.session_state['eco_alert_cache'] = set()
+# [NEW] 전체 토글 상태 추적용 세션 스테이트
+if 'global_toggles' not in st.session_state: st.session_state['global_toggles'] = {}
 
 price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
@@ -275,12 +277,12 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V57 (Global Toggles & Fix) 가동")
+            try: bot.send_message(chat_id, "🤖 DeBrief V58 (Toggle Fixed) 가동")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V57*\n/on /off : 시스템\n/list /add /del : 관리\n/news /sec /earning /eco : 정보")
+                msg = ("🤖 *DeBrief V58*\n/on /off : 시스템\n/list /add /del : 관리\n/news /sec /earning /eco : 정보")
                 bot.reply_to(m, msg, parse_mode='Markdown')
 
             @bot.message_handler(commands=['on'])
@@ -454,31 +456,25 @@ def start_background_worker():
             def analyze_ticker(ticker, settings, token, chat_id):
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 1. 뉴스 및 공시 (수정됨: 설정에 따라 각각 Fetch)
+                    # 1. 뉴스 및 공시
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         current_config = load_config()
                         history = current_config.get('news_history', {})
                         if ticker not in history: history[ticker] = []
                         
                         items = []
-                        # [FIX] 뉴스 설정이 켜져있으면 일반 뉴스 수집
                         if settings.get('📰 뉴스'):
                             items += get_integrated_news(ticker, False)
-                        # [FIX] SEC 설정이 켜져있으면 SEC 공시 수집
                         if settings.get('🏛️ SEC'):
                             items += get_integrated_news(ticker, True)
                             
-                        # 날짜순 정렬 (최신이 먼저 오게)
                         items.sort(key=lambda x: x['dt_obj'], reverse=True)
-
                         updated = False
                         sent_count_this_cycle = 0 
                         
                         for item in items:
-                            # 중복 체크
                             if item['hash'] in history[ticker] or item['link'] in history[ticker]: continue
                             
-                            # [Double Check] 보내기 직전 필터링 (위에서 수집할 때 이미 걸렀지만 안전장치)
                             is_sec = item.get('is_sec', False) or "SEC" in item['title']
                             should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
                             
@@ -487,19 +483,17 @@ def start_background_worker():
                                 try:
                                     requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
                                 except: pass
-                                
                                 history[ticker].append(item['hash'])
                                 if len(history[ticker]) > 50: history[ticker].pop(0)
                                 updated = True
                                 sent_count_this_cycle += 1
-                            
                             if sent_count_this_cycle >= 1: break 
 
                         if updated:
                             current_config['news_history'] = history
                             save_config(current_config)
 
-                    # 2. 가격 (3%)
+                    # 2. 가격
                     if settings.get('📈 급등락(3%)'):
                         stock = yf.Ticker(ticker)
                         h = stock.history(period="1d")
@@ -525,11 +519,9 @@ def start_background_worker():
 
             t_mon = threading.Thread(target=monitor_loop, daemon=True, name="DeBrief_Worker")
             t_mon.start()
-            
             while True:
                 try: bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
                 except: time.sleep(5)
-
         except Exception as e: write_log(f"Bot Error: {e}")
 
     t_bot = threading.Thread(target=run_bot_system, daemon=True, name="DeBrief_Worker")
@@ -548,6 +540,7 @@ st.markdown("""<style>
     .stock-price-box { display: inline-block; padding: 3px 8px; border-radius: 12px; font-size: 0.8em; font-weight: 700; }
     .up-theme { background-color: #E6F4EA; color: #137333; } .down-theme { background-color: #FCE8E6; color: #C5221F; }
     .stButton button { width: 100%; border-radius: 5px; }
+    div[data-testid="stColumn"] { text-align: center; }
 </style>""", unsafe_allow_html=True)
 
 config = load_config()
@@ -569,7 +562,7 @@ with st.sidebar:
             config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
             save_config(config); st.rerun()
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V57)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V58)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
@@ -593,28 +586,34 @@ with t2:
 
     st.divider()
     st.markdown("#### ⚡ 항목별 일괄 설정 (Global Toggles)")
-    st.caption("아래 버튼을 누르면 모든 종목의 해당 설정이 켜지거나 꺼집니다.")
+    st.caption("체크박스를 클릭하면 모든 종목의 해당 설정이 동기화됩니다.")
     
-    # [NEW] 항목별 전체 On/Off 기능 구현
+    # [FIX] 체크박스 기반의 즉시 반영 로직 구현
     opt_keys = list(DEFAULT_OPTS.keys())
-    # 레이아웃: 항목 갯수만큼 컬럼 생성
     toggle_cols = st.columns(len(opt_keys))
     
     for idx, key in enumerate(opt_keys):
+        # 세션 스테이트 초기화 (각 키별로)
+        if key not in st.session_state['global_toggles']:
+            st.session_state['global_toggles'][key] = True
+
         with toggle_cols[idx]:
-            # 항목 이름 표시 (짧게)
+            # 항목 이름 표시
             clean_name = key.split()[1] if " " in key else key
             st.markdown(f"**{clean_name}**")
             
-            # On 버튼
-            if st.button("On", key=f"global_on_{idx}"):
-                for t in config['tickers']: config['tickers'][t][key] = True
-                save_config(config); st.rerun()
-                
-            # Off 버튼 (빨간색 텍스트 효과는 어렵지만 버튼으로 구현)
-            if st.button("Off", key=f"global_off_{idx}"):
-                for t in config['tickers']: config['tickers'][t][key] = False
-                save_config(config); st.rerun()
+            # 체크박스 생성
+            # value는 세션 상태에서 가져오고, 변경 시 로직 실행
+            new_val = st.checkbox("전체", key=f"g_chk_{idx}", value=st.session_state['global_toggles'][key])
+            
+            # [Core Logic] 값이 변경되었는지 감지
+            if new_val != st.session_state['global_toggles'][key]:
+                st.session_state['global_toggles'][key] = new_val # 상태 업데이트
+                # 모든 티커에 일괄 적용
+                for t in config['tickers']:
+                    config['tickers'][t][key] = new_val
+                save_config(config) # 저장
+                st.rerun() # 즉시 새로고침하여 아래 리스트 업데이트
 
     st.divider()
     st.markdown("#### 📋 종목 관리")
@@ -626,9 +625,10 @@ with t2:
         save_config(config); st.rerun()
     
     if config['tickers']:
-        # 데이터 에디터로 개별 설정 수정 가능
+        # 개별 수정 가능한 데이터 에디터
         df = pd.DataFrame(config['tickers']).T
         edited = st.data_editor(df, use_container_width=True)
+        # 에디터에서 수정 사항 발생 시 저장
         if not df.equals(edited):
             config['tickers'] = edited.to_dict(orient='index')
             save_config(config); st.toast("Saved!")
