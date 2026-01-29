@@ -562,9 +562,9 @@ def start_background_worker():
                 # 구버전 키 방지 (마이그레이션된 키 사용)
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 뉴스 (시간당 3개 제한 + 중요 뉴스만)
+                    # 뉴스 (엄격한 필터: 속보/중대 뉴스만)
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
-                        MAX_NEWS_PER_HOUR = 3
+                        MAX_NEWS_PER_HOUR = 1  # 시간당 1개로 제한
                         now = datetime.now()
                         news_sent_times[:] = [t for t in news_sent_times if (now - t).total_seconds() < 3600]
 
@@ -573,26 +573,25 @@ def start_background_worker():
                         else:
                             items = get_integrated_news(ticker, False)
                             if items:
-                                # 중요 뉴스 키워드 필터
-                                IMPORTANT_KEYWORDS = [
-                                    # 영문
-                                    'breaking', 'urgent', 'alert', 'surges', 'plunges', 'soars', 'crashes',
-                                    'jumps', 'tumbles', 'spikes', 'plummets', 'rockets', 'tanks',
-                                    'record', 'all-time', 'historic', 'massive', 'major',
-                                    'beats', 'misses', 'exceeds', 'warns', 'cuts', 'raises',
-                                    'acquisition', 'merger', 'buyout', 'lawsuit', 'investigation',
-                                    'fda', 'approved', 'recall', 'bankruptcy', 'layoffs',
-                                    # 한글
-                                    '속보', '긴급', '급등', '급락', '폭등', '폭락', '사상최고', '신고가',
-                                    '실적', '어닝', '인수', '합병', '소송', '파산', '해고', '승인'
+                                # 엄격한 중요 뉴스 키워드 (속보/긴급만)
+                                BREAKING_KEYWORDS = [
+                                    'breaking', 'urgent', 'just in',
+                                    'surges', 'plunges', 'soars', 'crashes', 'plummets', 'rockets',
+                                    'bankruptcy', 'lawsuit', 'investigation', 'fraud', 'sec charges',
+                                    'fda approves', 'fda rejects', 'recall',
+                                    'acquisition', 'merger', 'takeover', 'buyout',
+                                    '속보', '긴급', '급등', '급락', '폭등', '폭락', '파산', '인수', '합병'
                                 ]
 
                                 important_item = None
                                 for item in items:
-                                    title_lower = item['title'].lower() + ' ' + item.get('raw_title', '').lower()
-                                    is_important = any(kw in title_lower for kw in IMPORTANT_KEYWORDS)
-                                    is_sec = "SEC" in item['title'] or "8-K" in item['title'] or "10-Q" in item['title']
-                                    if is_important or is_sec:
+                                    raw_title = item.get('raw_title', '').lower()
+                                    # SEC 공시는 항상 중요
+                                    is_sec = any(x in raw_title for x in ['8-k', '10-q', '10-k', 'sec filing', 'sec charges'])
+                                    # 속보 키워드 체크 (원문 제목에서만)
+                                    is_breaking = any(kw in raw_title for kw in BREAKING_KEYWORDS)
+
+                                    if is_sec or is_breaking:
                                         important_item = item
                                         break
 
@@ -603,7 +602,7 @@ def start_background_worker():
                                     if ticker not in history: history[ticker] = []
 
                                     if item['link'] not in history[ticker]:
-                                        is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                                        is_sec = any(x in item.get('raw_title', '').lower() for x in ['8-k', '10-q', '10-k', 'sec'])
                                         should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
 
                                         if should_send:
