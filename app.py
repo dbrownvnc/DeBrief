@@ -256,7 +256,7 @@ def get_economic_events():
                 'impact': event.find('impact').text,
                 'forecast': event.find('forecast').text or "",
                 'previous': event.find('previous').text or "",
-                'actual': "", 
+                'actual': "",
                 'id': f"{event.find('date').text}_{event.find('time').text}_{title}"
             })
         events.sort(key=lambda x: (x['date'], x['time']))
@@ -435,10 +435,15 @@ def start_background_worker():
             def p_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
-                    price = yf.Ticker(t).fast_info.last_price
-                    bot.reply_to(m, f"💰 *{t}*: `${price:.2f}`", parse_mode='Markdown')
+                    bot.send_chat_action(m.chat.id, 'typing')
+                    fi = yf.Ticker(t).fast_info
+                    price = fi.last_price
+                    prev = fi.previous_close
+                    chg = ((price - prev) / prev) * 100
+                    emoji = "🟢" if chg >= 0 else "🔴"
+                    bot.reply_to(m, f"💰 *{t}*: `${price:.2f}` {emoji} ({chg:+.2f}%)", parse_mode='Markdown')
                 except IndexError: bot.reply_to(m, "사용법: /p [티커]")
-                except Exception as e: bot.reply_to(m, f"❌ 조회 실패: {e}")
+                except Exception as e: bot.reply_to(m, f"❌ 조회 실패: 티커를 확인하세요")
 
             @bot.message_handler(commands=['list'])
             def list_cmd(m):
@@ -485,6 +490,7 @@ def start_background_worker():
             @bot.message_handler(commands=['vix'])
             def vix_cmd(m):
                 try:
+                    bot.send_chat_action(m.chat.id, 'typing')
                     vix = yf.Ticker("^VIX")
                     info = vix.fast_info
                     curr = info.last_price
@@ -497,7 +503,7 @@ def start_background_worker():
                     elif curr < 30: level = "😱 매우 높음 (경계)"
                     else: level = "🚨 극단적 (공포)"
                     bot.reply_to(m, f"📊 *VIX 공포지수*\n\n현재: `{curr:.2f}` ({chg:+.2f}%)\n전일: `{prev:.2f}`\n상태: {level}", parse_mode='Markdown')
-                except: bot.reply_to(m, "❌ VIX 조회 실패")
+                except Exception as e: bot.reply_to(m, "❌ VIX 조회 실패")
 
             try:
                 bot.set_my_commands([
