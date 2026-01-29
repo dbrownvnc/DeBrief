@@ -562,7 +562,7 @@ def start_background_worker():
                 # 구버전 키 방지 (마이그레이션된 키 사용)
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 뉴스 (엄격한 필터: 속보/중대 뉴스만)
+                    # 뉴스 (엄격한 필터: 속보/중대 뉴스만, 1분 이내만)
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
                         MAX_NEWS_PER_HOUR = 1  # 시간당 1개로 제한
                         now = datetime.now()
@@ -585,10 +585,19 @@ def start_background_worker():
 
                                 important_item = None
                                 for item in items:
+                                    # 1분 이내 뉴스만 허용
+                                    try:
+                                        news_date_str = item.get('date', '')
+                                        if news_date_str and news_date_str != 'Recent':
+                                            news_dt = datetime.strptime(f"{now.year}/{news_date_str}", '%Y/%m/%d %H:%M')
+                                            age_seconds = (datetime.utcnow() - news_dt).total_seconds()
+                                            if age_seconds > 60:  # 1분 초과시 스킵
+                                                continue
+                                    except:
+                                        continue  # 날짜 파싱 실패시 스킵
+
                                     raw_title = item.get('raw_title', '').lower()
-                                    # SEC 공시는 항상 중요
                                     is_sec = any(x in raw_title for x in ['8-k', '10-q', '10-k', 'sec filing', 'sec charges'])
-                                    # 속보 키워드 체크 (원문 제목에서만)
                                     is_breaking = any(kw in raw_title for kw in BREAKING_KEYWORDS)
 
                                     if is_sec or is_breaking:
