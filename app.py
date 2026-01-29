@@ -563,10 +563,17 @@ with st.sidebar:
     save_config(config)
 
     with st.expander("🔑 Keys"):
-        bot_t = st.text_input("Bot Token", value=config['telegram'].get('bot_token', ''), type="password")
-        chat_i = st.text_input("Chat ID", value=config['telegram'].get('chat_id', ''))
+        # 현재 설정 상태 표시 (값은 숨김)
+        has_token = bool(config['telegram'].get('bot_token', ''))
+        has_chat = bool(config['telegram'].get('chat_id', ''))
+        st.caption(f"Bot Token: {'✅ 설정됨' if has_token else '❌ 미설정'} | Chat ID: {'✅ 설정됨' if has_chat else '❌ 미설정'}")
+
+        bot_t = st.text_input("Bot Token", value="", type="password", placeholder="새 토큰 입력 (변경시에만)")
+        chat_i = st.text_input("Chat ID", value="", type="password", placeholder="새 Chat ID 입력 (변경시에만)")
         if st.button("Save Keys"):
-            config['telegram'].update({"bot_token": bot_t, "chat_id": chat_i})
+            # 입력된 값이 있을 때만 업데이트
+            if bot_t: config['telegram']['bot_token'] = bot_t
+            if chat_i: config['telegram']['chat_id'] = chat_i
             save_config(config); st.rerun()
 
 st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V55)</h3>", unsafe_allow_html=True)
