@@ -562,36 +562,59 @@ def start_background_worker():
                 # 구버전 키 방지 (마이그레이션된 키 사용)
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 뉴스 (시간당 3개 제한)
+                    # 뉴스 (시간당 3개 제한 + 중요 뉴스만)
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
-                        MAX_NEWS_PER_HOUR = 3  # 시간당 전체 뉴스 알림 최대 3개
+                        MAX_NEWS_PER_HOUR = 3
                         now = datetime.now()
-                        # 1시간 이내 알림만 유지
                         news_sent_times[:] = [t for t in news_sent_times if (now - t).total_seconds() < 3600]
 
                         if len(news_sent_times) >= MAX_NEWS_PER_HOUR:
-                            pass  # 시간당 제한 도달
+                            pass
                         else:
                             items = get_integrated_news(ticker, False)
                             if items:
-                                item = items[0]
-                                current_config = load_config()
-                                history = current_config.get('news_history', {})
-                                if ticker not in history: history[ticker] = []
+                                # 중요 뉴스 키워드 필터
+                                IMPORTANT_KEYWORDS = [
+                                    # 영문
+                                    'breaking', 'urgent', 'alert', 'surges', 'plunges', 'soars', 'crashes',
+                                    'jumps', 'tumbles', 'spikes', 'plummets', 'rockets', 'tanks',
+                                    'record', 'all-time', 'historic', 'massive', 'major',
+                                    'beats', 'misses', 'exceeds', 'warns', 'cuts', 'raises',
+                                    'acquisition', 'merger', 'buyout', 'lawsuit', 'investigation',
+                                    'fda', 'approved', 'recall', 'bankruptcy', 'layoffs',
+                                    # 한글
+                                    '속보', '긴급', '급등', '급락', '폭등', '폭락', '사상최고', '신고가',
+                                    '실적', '어닝', '인수', '합병', '소송', '파산', '해고', '승인'
+                                ]
 
-                                if item['link'] not in history[ticker]:
-                                    is_sec = "SEC" in item['title'] or "8-K" in item['title']
-                                    should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
+                                important_item = None
+                                for item in items:
+                                    title_lower = item['title'].lower() + ' ' + item.get('raw_title', '').lower()
+                                    is_important = any(kw in title_lower for kw in IMPORTANT_KEYWORDS)
+                                    is_sec = "SEC" in item['title'] or "8-K" in item['title'] or "10-Q" in item['title']
+                                    if is_important or is_sec:
+                                        important_item = item
+                                        break
 
-                                    if should_send:
-                                        prefix = "🏛️" if is_sec else "📰"
-                                        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+                                if important_item:
+                                    item = important_item
+                                    current_config = load_config()
+                                    history = current_config.get('news_history', {})
+                                    if ticker not in history: history[ticker] = []
 
-                                        history[ticker].append(item['link'])
-                                        if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
-                                        current_config['news_history'] = history
-                                        save_config(current_config)
-                                        news_sent_times.append(now)  # 알림 시간 기록
+                                    if item['link'] not in history[ticker]:
+                                        is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                                        should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
+
+                                        if should_send:
+                                            prefix = "🏛️" if is_sec else "🔥"
+                                            requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
+
+                                            history[ticker].append(item['link'])
+                                            if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
+                                            current_config['news_history'] = history
+                                            save_config(current_config)
+                                            news_sent_times.append(now)
 
                     # 가격 (3%)
                     if settings.get('📈 급등락(3%)'):
