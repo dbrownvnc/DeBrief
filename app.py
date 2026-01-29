@@ -193,6 +193,13 @@ def get_integrated_news(ticker, is_sec_search=False):
                 except: continue
         except: pass
     for url in search_urls: fetch(url)
+    # 최신순 정렬 (날짜 파싱 실패시 맨 뒤로)
+    def parse_date(item):
+        try:
+            return datetime.strptime(item['date'], '%m/%d %H:%M')
+        except:
+            return datetime.min
+    collected_items.sort(key=parse_date, reverse=True)
     return collected_items
 
 def get_finviz_data(ticker):
@@ -471,20 +478,24 @@ def start_background_worker():
                         
                         items = get_integrated_news(ticker, False)
                         updated = False
-                        
+                        sent_count = 0  # 한 번에 보내는 뉴스 수 제한
+                        MAX_NEWS_PER_CHECK = 2  # 티커당 최대 2개
+
                         for item in items:
+                            if sent_count >= MAX_NEWS_PER_CHECK: break  # 최대치 도달시 중단
                             if item['link'] in history[ticker]: continue
-                            
+
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
                             should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
-                            
+
                             if should_send:
                                 prefix = "🏛️" if is_sec else "📰"
                                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-                                
+
                                 history[ticker].append(item['link'])
                                 if len(history[ticker]) > 30: history[ticker].pop(0)
                                 updated = True
+                                sent_count += 1
                         if updated:
                             current_config['news_history'] = history
                             save_config(current_config)
