@@ -205,13 +205,13 @@ def get_integrated_news(ticker, is_sec_search=False):
 def get_finviz_data(ticker):
     try:
         url = f"https://finviz.com/quote.ashx?t={ticker}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         try:
             scraper = cloudscraper.create_scraper()
-            resp = scraper.get(url, timeout=5)
+            resp = scraper.get(url, timeout=10)
             text = resp.text
         except:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            resp = requests.get(url, headers=headers, timeout=5)
+            resp = requests.get(url, headers=headers, timeout=10)
             text = resp.text
         dfs = pd.read_html(text)
         data = {}
@@ -224,14 +224,22 @@ def get_finviz_data(ticker):
                             for k, v in zip(keys, values): data[str(k)] = str(v)
                         except: pass
         return data
-    except: return {}
+    except Exception as e:
+        write_log(f"Finviz 에러 ({ticker}): {e}")
+        return {}
 
 def get_economic_events():
     try:
-        scraper = cloudscraper.create_scraper()
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        resp = scraper.get(url)
-        if resp.status_code != 200: return []
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        try:
+            scraper = cloudscraper.create_scraper()
+            resp = scraper.get(url, timeout=10)
+        except:
+            resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            write_log(f"경제일정 HTTP 에러: {resp.status_code}")
+            return []
         root = ET.fromstring(resp.content)
         events = []
         translator = GoogleTranslator(source='auto', target='ko')
@@ -253,7 +261,9 @@ def get_economic_events():
             })
         events.sort(key=lambda x: (x['date'], x['time']))
         return events
-    except: return []
+    except Exception as e:
+        write_log(f"경제일정 에러: {e}")
+        return []
 
 # ---------------------------------------------------------
 # [3] 백그라운드 봇
@@ -318,25 +328,28 @@ def start_background_worker():
                     if len(parts) < 2: return bot.reply_to(m, "사용법: /earning [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
-                    data = get_finviz_data(t)
                     msg = ""
-                    if 'Earnings' in data and data['Earnings'] != '-':
-                        e_date = data['Earnings']
-                        clean_date = e_date.replace(' BMO','').replace(' AMC','')
-                        time_icon = "☀️ 장전" if "BMO" in e_date else "🌙 장후" if "AMC" in e_date else ""
-                        msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{clean_date}` {time_icon}\nℹ️ 출처: Finviz"
-                    if not msg:
+                    # 1차: yfinance (더 안정적)
+                    try:
                         stock = yf.Ticker(t)
-                        try:
-                            dates = stock.earnings_dates
-                            if dates is not None and not dates.empty:
-                                if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
-                                target = dates.index[0]
-                                msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{target.strftime('%Y-%m-%d')}`\n(Yfinance)"
-                        except: pass
+                        dates = stock.earnings_dates
+                        if dates is not None and not dates.empty:
+                            if dates.index.tz is not None: dates.index = dates.index.tz_localize(None)
+                            target = dates.index[0]
+                            msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{target.strftime('%Y-%m-%d')}`"
+                    except: pass
+                    # 2차: Finviz (백업)
+                    if not msg:
+                        data = get_finviz_data(t)
+                        if 'Earnings' in data and data['Earnings'] != '-':
+                            e_date = data['Earnings']
+                            clean_date = e_date.replace(' BMO','').replace(' AMC','')
+                            time_icon = "☀️ 장전" if "BMO" in e_date else "🌙 장후" if "AMC" in e_date else ""
+                            msg = f"📅 *{t} 실적 발표*\n🗓️ 일시: `{clean_date}` {time_icon}"
                     if msg: bot.reply_to(m, msg, parse_mode='Markdown')
-                    else: bot.reply_to(m, f"❌ {t}: 정보 없음.")
-                except: bot.reply_to(m, "오류 발생")
+                    else: bot.reply_to(m, f"❌ {t}: 실적 발표 정보 없음")
+                except Exception as e:
+                    bot.reply_to(m, f"❌ 조회 실패: 티커를 확인하세요")
 
             @bot.message_handler(commands=['summary', '요약'])
             def summary_cmd(m):
@@ -345,18 +358,34 @@ def start_background_worker():
                     if len(parts) < 2: return bot.reply_to(m, "사용법: /summary [티커]")
                     t = parts[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
-                    d = get_finviz_data(t)
-                    try: 
+                    # yfinance 데이터 (안정적)
+                    curr_p = None; mkt_cap_y = None; prev_close = None
+                    try:
                         fi = yf.Ticker(t).fast_info
-                        curr_p = fi.last_price; mkt_cap_y = fi.market_cap
-                    except: curr_p = None; mkt_cap_y = None
+                        curr_p = fi.last_price
+                        mkt_cap_y = fi.market_cap
+                        prev_close = fi.previous_close
+                    except: pass
+                    # Finviz 데이터 (추가 정보)
+                    d = get_finviz_data(t)
                     price = f"{curr_p:.2f}" if curr_p else d.get('Price', 'N/A')
                     pe = d.get('P/E', 'N/A'); pbr = d.get('P/B', 'N/A')
                     cap = d.get('Market Cap', 'N/A'); target = d.get('Target Price', 'N/A')
                     if cap == 'N/A' and mkt_cap_y: cap = f"${mkt_cap_y/1e9:.2f}B"
-                    msg = (f"📊 *{t} 재무 요약*\n💰 현재가: `${price}`\n🏢 시가총액: `{cap}`\n📈 PER: `{pe}`\n📚 PBR: `{pbr}`\n🎯 목표주가: `${target}`")
+                    # 변동률 계산
+                    chg_str = ""
+                    if curr_p and prev_close:
+                        chg = ((curr_p - prev_close) / prev_close) * 100
+                        chg_str = f" ({chg:+.2f}%)"
+                    msg = (f"📊 *{t} 재무 요약*\n"
+                           f"💰 현재가: `${price}`{chg_str}\n"
+                           f"🏢 시가총액: `{cap}`\n"
+                           f"📈 PER: `{pe}`\n"
+                           f"📚 PBR: `{pbr}`\n"
+                           f"🎯 목표주가: `${target}`")
                     bot.reply_to(m, msg, parse_mode='Markdown')
-                except: bot.reply_to(m, "오류 발생")
+                except Exception as e:
+                    bot.reply_to(m, f"❌ 조회 실패: 티커를 확인하세요")
 
             @bot.message_handler(commands=['eco'])
             def eco_cmd(m):
