@@ -373,54 +373,82 @@ def start_background_worker():
                         c+=1
                         if c>=15: break
                     bot.reply_to(m, msg, parse_mode='Markdown')
-                except: pass
+                except Exception as e: bot.reply_to(m, f"❌ 경제일정 조회 실패")
 
             @bot.message_handler(commands=['news'])
             def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
+                    bot.send_chat_action(m.chat.id, 'typing')
                     items = get_integrated_news(t, False)
                     if not items: return bot.reply_to(m, "뉴스 없음")
                     msg = [f"📰 *{t} News*"]
                     for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('[','').replace(']','')}]({i['link']})")
                     bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
-                except: pass
+                except IndexError: bot.reply_to(m, "사용법: /news [티커]")
+                except Exception as e: bot.reply_to(m, f"❌ 뉴스 조회 실패")
 
             @bot.message_handler(commands=['sec'])
             def sec_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
+                    bot.send_chat_action(m.chat.id, 'typing')
                     items = get_integrated_news(t, True)
                     if items:
                         msg = [f"🏛️ *{t} SEC*"]
                         for i in items: msg.append(f"▪️ `[{i['date']}]` [{i['title'].replace('🏛️ ','').replace('[','').replace(']','')}]({i['link']})")
                         bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
                     else: bot.reply_to(m, f"❌ {t} 공시 없음")
-                except: pass
+                except IndexError: bot.reply_to(m, "사용법: /sec [티커]")
+                except Exception as e: bot.reply_to(m, f"❌ SEC 조회 실패")
 
             @bot.message_handler(commands=['p'])
             def p_cmd(m):
-                try: bot.reply_to(m, f"💰 *{m.text.split()[1].upper()}*: `${yf.Ticker(m.text.split()[1].upper()).fast_info.last_price:.2f}`", parse_mode='Markdown')
-                except: pass
+                try:
+                    t = m.text.split()[1].upper()
+                    price = yf.Ticker(t).fast_info.last_price
+                    bot.reply_to(m, f"💰 *{t}*: `${price:.2f}`", parse_mode='Markdown')
+                except IndexError: bot.reply_to(m, "사용법: /p [티커]")
+                except Exception as e: bot.reply_to(m, f"❌ 조회 실패: {e}")
 
             @bot.message_handler(commands=['list'])
             def list_cmd(m):
-                try: c = load_config(); bot.reply_to(m, f"📋 목록: {', '.join(c['tickers'].keys())}")
-                except: pass
+                try:
+                    c = load_config()
+                    tickers = list(c['tickers'].keys())
+                    if tickers:
+                        bot.reply_to(m, f"📋 감시목록 ({len(tickers)}개):\n`{', '.join(tickers)}`", parse_mode='Markdown')
+                    else:
+                        bot.reply_to(m, "📋 감시목록이 비어있습니다.\n/add [티커]로 추가하세요.")
+                except Exception as e: bot.reply_to(m, f"❌ 목록 조회 실패")
 
             @bot.message_handler(commands=['add'])
             def add_cmd(m):
                 try:
-                    t = m.text.split()[1].upper(); c = load_config()
-                    if t not in c['tickers']: c['tickers'][t] = DEFAULT_OPTS.copy(); save_config(c); bot.reply_to(m, f"✅ {t} 추가됨")
-                except: pass
+                    t = m.text.split()[1].upper()
+                    c = load_config()
+                    if t in c['tickers']:
+                        bot.reply_to(m, f"⚠️ {t}은(는) 이미 목록에 있습니다.")
+                    else:
+                        c['tickers'][t] = DEFAULT_OPTS.copy()
+                        save_config(c)
+                        bot.reply_to(m, f"✅ {t} 추가됨")
+                except IndexError: bot.reply_to(m, "사용법: /add [티커]")
+                except Exception as e: bot.reply_to(m, f"❌ 추가 실패")
 
             @bot.message_handler(commands=['del'])
             def del_cmd(m):
                 try:
-                    t = m.text.split()[1].upper(); c = load_config()
-                    if t in c['tickers']: del c['tickers'][t]; save_config(c); bot.reply_to(m, f"🗑️ {t} 삭제됨")
-                except: pass
+                    t = m.text.split()[1].upper()
+                    c = load_config()
+                    if t in c['tickers']:
+                        del c['tickers'][t]
+                        save_config(c)
+                        bot.reply_to(m, f"🗑️ {t} 삭제됨")
+                    else:
+                        bot.reply_to(m, f"⚠️ {t}은(는) 목록에 없습니다.")
+                except IndexError: bot.reply_to(m, "사용법: /del [티커]")
+                except Exception as e: bot.reply_to(m, f"❌ 삭제 실패")
 
             @bot.message_handler(commands=['ping'])
             def ping_cmd(m): bot.reply_to(m, "🏓 Pong! 정상.")
@@ -444,15 +472,23 @@ def start_background_worker():
 
             try:
                 bot.set_my_commands([
-                    BotCommand("eco", "📅 경제지표"), BotCommand("earning", "💰 실적 발표"),
-                    BotCommand("news", "📰 뉴스"), BotCommand("summary", "📊 요약"),
-                    BotCommand("p", "💰 현재가"), BotCommand("sec", "🏛️ 공시"),
-                    BotCommand("vix", "📊 VIX 공포지수"), BotCommand("ping", "🏓 생존확인"),
-                    BotCommand("list", "📋 목록"), BotCommand("on", "🟢 가동"),
-                    BotCommand("off", "⛔ 정지"), BotCommand("add", "➕ 추가"),
-                    BotCommand("del", "🗑️ 삭제")
+                    BotCommand("start", "🤖 시작/도움말"),
+                    BotCommand("p", "💰 현재가"),
+                    BotCommand("vix", "📊 VIX 공포지수"),
+                    BotCommand("summary", "📊 재무요약"),
+                    BotCommand("earning", "💰 실적발표"),
+                    BotCommand("news", "📰 뉴스"),
+                    BotCommand("sec", "🏛️ SEC 공시"),
+                    BotCommand("eco", "📅 경제지표"),
+                    BotCommand("list", "📋 감시목록"),
+                    BotCommand("add", "➕ 티커추가"),
+                    BotCommand("del", "🗑️ 티커삭제"),
+                    BotCommand("on", "🟢 시스템가동"),
+                    BotCommand("off", "⛔ 시스템정지"),
+                    BotCommand("ping", "🏓 생존확인")
                 ])
-            except: pass
+                write_log("✅ 텔레그램 명령어 메뉴 등록 완료")
+            except Exception as e: write_log(f"❌ 명령어 메뉴 등록 실패: {e}")
 
             def monitor_loop():
                 nonlocal last_weekly_sent, last_daily_sent
@@ -543,11 +579,11 @@ def start_background_worker():
                             elif 35 < rsi < 65: rsi_alert_status[ticker] = "NORMAL"
                 except: pass
 
-            t_mon = threading.Thread(target=monitor_loop, daemon=True, name="DeBrief_Worker")
+            t_mon = threading.Thread(target=monitor_loop, daemon=True, name="DeBrief_Monitor")
             t_mon.start()
-            
+
             while True:
-                try: bot.infinity_polling(timeout=10, long_polling_timeout=5, skip_pending=True)
+                try: bot.infinity_polling(timeout=10, long_polling_timeout=5)
                 except: time.sleep(5)
 
         except Exception as e: write_log(f"Bot Error: {e}")
