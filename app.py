@@ -610,7 +610,11 @@ def start_background_worker():
                                     history = current_config.get('news_history', {})
                                     if ticker not in history: history[ticker] = []
 
-                                    if item['link'] not in history[ticker]:
+                                    # 중복 체크: 링크 또는 (제목+시간) 조합
+                                    title_date_key = f"{item.get('raw_title', '')[:50]}_{item.get('date', '')}"
+                                    is_duplicate = item['link'] in history[ticker] or title_date_key in history[ticker]
+
+                                    if not is_duplicate:
                                         is_sec = any(x in item.get('raw_title', '').lower() for x in ['8-k', '10-q', '10-k', 'sec'])
                                         should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
 
@@ -618,8 +622,10 @@ def start_background_worker():
                                             prefix = "🏛️" if is_sec else "🔥"
                                             requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
 
+                                            # 링크와 제목+시간 모두 저장
                                             history[ticker].append(item['link'])
-                                            if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
+                                            history[ticker].append(title_date_key)
+                                            if len(history[ticker]) > 100: history[ticker] = history[ticker][-100:]
                                             current_config['news_history'] = history
                                             save_config(current_config)
                                             news_sent_times.append(now)
