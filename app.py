@@ -562,17 +562,18 @@ def start_background_worker():
                 try:
                     # 뉴스
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
-                        current_config = load_config()
-                        history = current_config.get('news_history', {})
-                        if ticker not in history: history[ticker] = []
-                        
                         items = get_integrated_news(ticker, False)
-                        updated = False
-                        sent_count = 0  # 한 번에 보내는 뉴스 수 제한
-                        MAX_NEWS_PER_CHECK = 2  # 티커당 최대 2개
+                        if not items: return
 
-                        for item in items:
-                            if sent_count >= MAX_NEWS_PER_CHECK: break  # 최대치 도달시 중단
+                        sent_count = 0
+                        MAX_NEWS_PER_CHECK = 1  # 티커당 최대 1개로 제한
+
+                        for item in items[:MAX_NEWS_PER_CHECK]:  # 최신 뉴스만 처리
+                            # 매번 최신 히스토리 로드 (동시성 문제 방지)
+                            current_config = load_config()
+                            history = current_config.get('news_history', {})
+                            if ticker not in history: history[ticker] = []
+
                             if item['link'] in history[ticker]: continue
 
                             is_sec = "SEC" in item['title'] or "8-K" in item['title']
@@ -583,12 +584,11 @@ def start_background_worker():
                                 requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
 
                                 history[ticker].append(item['link'])
-                                if len(history[ticker]) > 30: history[ticker].pop(0)
-                                updated = True
+                                if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
+                                current_config['news_history'] = history
+                                save_config(current_config)
                                 sent_count += 1
-                        if updated:
-                            current_config['news_history'] = history
-                            save_config(current_config)
+                                break  # 1개 보내면 즉시 종료
 
                     # 가격 (3%)
                     if settings.get('📈 급등락(3%)'):
