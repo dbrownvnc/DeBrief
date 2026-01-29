@@ -22,10 +22,12 @@ LOG_FILE = 'debrief.log'
 if 'price_alert_cache' not in st.session_state: st.session_state['price_alert_cache'] = {}
 if 'rsi_alert_status' not in st.session_state: st.session_state['rsi_alert_status'] = {}
 if 'eco_alert_cache' not in st.session_state: st.session_state['eco_alert_cache'] = set()
+if 'news_sent_times' not in st.session_state: st.session_state['news_sent_times'] = []
 
 price_alert_cache = st.session_state['price_alert_cache']
 rsi_alert_status = st.session_state['rsi_alert_status']
 eco_alert_cache = st.session_state['eco_alert_cache']
+news_sent_times = st.session_state['news_sent_times']
 
 # ---------------------------------------------------------
 # [0] 로그 기록
@@ -560,35 +562,36 @@ def start_background_worker():
                 # 구버전 키 방지 (마이그레이션된 키 사용)
                 if not settings.get('🟢 감시', True): return
                 try:
-                    # 뉴스
+                    # 뉴스 (시간당 3개 제한)
                     if settings.get('📰 뉴스') or settings.get('🏛️ SEC'):
-                        items = get_integrated_news(ticker, False)
-                        if not items: return
+                        MAX_NEWS_PER_HOUR = 3  # 시간당 전체 뉴스 알림 최대 3개
+                        now = datetime.now()
+                        # 1시간 이내 알림만 유지
+                        news_sent_times[:] = [t for t in news_sent_times if (now - t).total_seconds() < 3600]
 
-                        sent_count = 0
-                        MAX_NEWS_PER_CHECK = 1  # 티커당 최대 1개로 제한
+                        if len(news_sent_times) >= MAX_NEWS_PER_HOUR:
+                            pass  # 시간당 제한 도달
+                        else:
+                            items = get_integrated_news(ticker, False)
+                            if items:
+                                item = items[0]
+                                current_config = load_config()
+                                history = current_config.get('news_history', {})
+                                if ticker not in history: history[ticker] = []
 
-                        for item in items[:MAX_NEWS_PER_CHECK]:  # 최신 뉴스만 처리
-                            # 매번 최신 히스토리 로드 (동시성 문제 방지)
-                            current_config = load_config()
-                            history = current_config.get('news_history', {})
-                            if ticker not in history: history[ticker] = []
+                                if item['link'] not in history[ticker]:
+                                    is_sec = "SEC" in item['title'] or "8-K" in item['title']
+                                    should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
 
-                            if item['link'] in history[ticker]: continue
+                                    if should_send:
+                                        prefix = "🏛️" if is_sec else "📰"
+                                        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
 
-                            is_sec = "SEC" in item['title'] or "8-K" in item['title']
-                            should_send = (is_sec and settings.get('🏛️ SEC')) or (not is_sec and settings.get('📰 뉴스'))
-
-                            if should_send:
-                                prefix = "🏛️" if is_sec else "📰"
-                                requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": f"🔔 {prefix} *[{ticker}]*\n`[{item['date']}]` [{item['title']}]({item['link']})", "parse_mode": "Markdown"})
-
-                                history[ticker].append(item['link'])
-                                if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
-                                current_config['news_history'] = history
-                                save_config(current_config)
-                                sent_count += 1
-                                break  # 1개 보내면 즉시 종료
+                                        history[ticker].append(item['link'])
+                                        if len(history[ticker]) > 50: history[ticker] = history[ticker][-50:]
+                                        current_config['news_history'] = history
+                                        save_config(current_config)
+                                        news_sent_times.append(now)  # 알림 시간 기록
 
                     # 가격 (3%)
                     if settings.get('📈 급등락(3%)'):
