@@ -56,7 +56,6 @@ def get_jsonbin_url():
     except: pass
     return None
 
-# [개편] 뉴스/SEC 개별 옵션을 제거하고 심플하게 통합
 DEFAULT_OPTS = {
     "🟢 감시": True, 
     "📈 급등락(3%)": True,
@@ -69,7 +68,6 @@ DEFAULT_OPTS = {
 }
 
 def migrate_options(old_opts):
-    """구버전 키를 신버전으로 자동 변환 (삭제된 기능 제외)"""
     new_opts = DEFAULT_OPTS.copy()
     mapping = {
         "감시_ON": "🟢 감시",
@@ -77,13 +75,9 @@ def migrate_options(old_opts):
         "52주_신고가": "🚀 신고가", "RSI": "📉 RSI", "MA_크로스": "〰️ MA크로스",
         "볼린저": "🛁 볼린저", "MACD": "🌊 MACD"
     }
-    
     for old_k, val in old_opts.items():
-        if old_k in mapping:
-            new_opts[mapping[old_k]] = val
-        elif old_k in new_opts:
-            new_opts[old_k] = val
-            
+        if old_k in mapping: new_opts[mapping[old_k]] = val
+        elif old_k in new_opts: new_opts[old_k] = val
     return new_opts
 
 def load_config():
@@ -96,7 +90,6 @@ def load_config():
             "NVDA": DEFAULT_OPTS.copy()
         }
     }
-    
     url = get_jsonbin_url()
     headers = get_jsonbin_headers()
     loaded_data = None
@@ -116,7 +109,6 @@ def load_config():
         if "telegram" in loaded_data: config['telegram'] = loaded_data['telegram']
         if "system_active" in loaded_data: config['system_active'] = loaded_data['system_active']
         if "eco_mode" in loaded_data: config['eco_mode'] = loaded_data['eco_mode']
-        
         if "tickers" in loaded_data:
             for t, opts in loaded_data['tickers'].items():
                 config['tickers'][t] = migrate_options(opts)
@@ -200,6 +192,41 @@ def get_economic_events():
         return events
     except Exception as e: return []
 
+def get_yahoo_news_list(ticker, limit=5):
+    """yfinance 실패 시 야후 RSS를 이중으로 크롤링하여 안정적으로 뉴스 반환"""
+    news_list = []
+    
+    # 1차 시도: yfinance 라이브러리
+    try:
+        y_news = yf.Ticker(ticker).news
+        if y_news and len(y_news) > 0:
+            for item in y_news[:limit]:
+                news_list.append({
+                    'title': item.get('title', ''),
+                    'link': item.get('link', '')
+                })
+    except:
+        pass
+        
+    # 2차 시도: 1차 실패 시 RSS 피드 직접 크롤링 (차단 위험 없음)
+    if not news_list:
+        try:
+            url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            resp = requests.get(url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                root = ET.fromstring(resp.content)
+                items = root.findall('.//item')
+                for item in items[:limit]:
+                    title = item.find('title').text if item.find('title') is not None else ''
+                    link = item.find('link').text if item.find('link') is not None else ''
+                    if title and link:
+                        news_list.append({'title': title, 'link': link})
+        except Exception as e:
+            write_log(f"RSS 크롤링 실패 ({ticker}): {e}")
+            
+    return news_list
+
 # ---------------------------------------------------------
 # [3] 백그라운드 봇 & 분석 엔진
 # ---------------------------------------------------------
@@ -220,12 +247,12 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V56 가동\n통합 재료 포착 엔진 업데이트 완료.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V57 가동\n강력한 뉴스 이중 백업 시스템 적용 완료.")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V56*\n"
+                msg = ("🤖 *DeBrief V57*\n"
                        "/on : 시스템 켜기\n"
                        "/off : 시스템 끄기\n"
                        "/earning [티커] : 실적발표\n"
@@ -330,25 +357,27 @@ def start_background_worker():
                     bot.reply_to(m, msg, parse_mode='Markdown')
                 except Exception as e: bot.reply_to(m, f"❌ 경제일정 조회 실패")
 
-            # [수정됨] 야후 파이낸스 뉴스 + 번역 로직으로 전면 교체
             @bot.message_handler(commands=['news'])
             def news_cmd(m):
                 try:
                     t = m.text.split()[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
-                    news_items = yf.Ticker(t).news
-                    if not news_items: return bot.reply_to(m, "최근 뉴스가 없습니다.")
+                    
+                    # [적용] 이중 백업 뉴스 함수 호출
+                    news_items = get_yahoo_news_list(t, limit=5)
+                    
+                    if not news_items: return bot.reply_to(m, "최근 뉴스를 찾을 수 없습니다.")
                     
                     msg = [f"📰 *{t} 최신 뉴스*"]
                     translator = GoogleTranslator(source='en', target='ko')
                     
-                    for i in news_items[:5]: # 상위 5개만
-                        raw_title = i.get('title', '')
-                        link = i.get('link', '')
+                    for i in news_items:
+                        raw_title = i['title']
+                        link = i['link']
                         try:
                             title_ko = translator.translate(raw_title)
                         except:
-                            title_ko = raw_title
+                            title_ko = raw_title # 번역 실패 시 원문
                         msg.append(f"▪️ [{title_ko}]({link})")
                         
                     bot.reply_to(m, "\n\n".join(msg), parse_mode='Markdown', disable_web_page_preview=True)
@@ -463,21 +492,22 @@ def start_background_worker():
                         if abs(pct_change - last_pct) >= 1.0:
                             price_alert_cache[ticker] = pct_change
                             
-                            # 재료(뉴스) 즉시 검색 및 번역
+                            # [적용] 재료(뉴스) 즉시 검색 및 번역 (이중 백업 로직)
                             news_text = "관련 뉴스를 찾을 수 없습니다. (수급/커뮤니티 이슈 가능성)"
-                            try:
-                                news_items = stock.news
-                                if news_items:
-                                    latest_news = news_items[0]
-                                    raw_title = latest_news.get('title', '')
-                                    link = latest_news.get('link', '')
-                                    
+                            news_items = get_yahoo_news_list(ticker, limit=1)
+                            
+                            if news_items:
+                                raw_title = news_items[0]['title']
+                                link = news_items[0]['link']
+                                
+                                try:
                                     translator = GoogleTranslator(source='en', target='ko')
-                                    try: translated_title = translator.translate(raw_title)
-                                    except: translated_title = raw_title
-                                        
-                                    news_text = f"[{translated_title}]({link})"
-                            except Exception as e: pass
+                                    translated_title = translator.translate(raw_title)
+                                except Exception as e:
+                                    write_log(f"번역 실패: {e}")
+                                    translated_title = raw_title # 번역 서버 오류 시 영어 원문 발송
+                                    
+                                news_text = f"[{translated_title}]({link})"
 
                             # 메시지 조립 및 전송
                             direction = "🚀 급등" if pct_change > 0 else "📉 급락"
@@ -580,7 +610,7 @@ with st.sidebar:
         st.error("⛔ Paused"); config['system_active'] = False
     save_config(config)
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V56)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V57)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
