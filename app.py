@@ -9,6 +9,7 @@ import threading
 import telebot
 import xml.etree.ElementTree as ET
 import cloudscraper
+from bs4 import BeautifulSoup  # [추가됨] HTML 파싱을 위한 확실한 라이브러리
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from telebot.types import BotCommand
@@ -39,7 +40,7 @@ def write_log(msg):
     except: pass
 
 # ---------------------------------------------------------
-# [1] 설정 로드/저장 (자동 마이그레이션 포함)
+# [1] 설정 로드/저장
 # ---------------------------------------------------------
 def get_jsonbin_headers():
     try:
@@ -192,39 +193,49 @@ def get_economic_events():
         return events
     except Exception as e: return []
 
-def get_yahoo_news_list(ticker, limit=5):
-    """yfinance 실패 시 야후 RSS를 이중으로 크롤링하여 안정적으로 뉴스 반환"""
+# [완전 교체] 절대 누락되지 않는 강력한 뉴스 수집기 (Finviz + Google RSS)
+def get_bulletproof_news(ticker, limit=5):
     news_list = []
     
-    # 1차 시도: yfinance 라이브러리
+    # 1차 시도: Finviz 스크래핑 (블룸버그, 로이터 등 종합 재료, 가장 정확함)
     try:
-        y_news = yf.Ticker(ticker).news
-        if y_news and len(y_news) > 0:
-            for item in y_news[:limit]:
-                news_list.append({
-                    'title': item.get('title', ''),
-                    'link': item.get('link', '')
-                })
-    except:
-        pass
+        url = f"https://finviz.com/quote.ashx?t={ticker}"
+        scraper = cloudscraper.create_scraper() # 봇 차단 우회
+        resp = scraper.get(url, timeout=5)
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-    # 2차 시도: 1차 실패 시 RSS 피드 직접 크롤링 (차단 위험 없음)
+        news_table = soup.find(id='news-table')
+        if news_table:
+            rows = news_table.findAll('tr')
+            for row in rows[:limit+3]: # 여유있게 가져와서 필터링
+                a_tag = row.find('a')
+                if a_tag:
+                    title = a_tag.text.strip()
+                    link = a_tag['href']
+                    if title and link and title not in [n['title'] for n in news_list]:
+                        news_list.append({'title': title, 'link': link})
+                        if len(news_list) >= limit: break
+    except Exception as e:
+        write_log(f"Finviz 뉴스 크롤링 실패 ({ticker}): {e}")
+
+    # 2차 시도: Finviz가 막혔거나 뉴스가 없을 경우 구글 뉴스 RSS 활용
     if not news_list:
         try:
-            url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            # 최근 1일(1d) 이내의 미국 주식 뉴스만 타겟팅
+            url = f"https://news.google.com/rss/search?q={ticker}+stock+news+when:1d&hl=en-US&gl=US&ceid=US:en"
+            headers = {'User-Agent': 'Mozilla/5.0'}
             resp = requests.get(url, headers=headers, timeout=5)
             if resp.status_code == 200:
                 root = ET.fromstring(resp.content)
-                items = root.findall('.//item')
-                for item in items[:limit]:
-                    title = item.find('title').text if item.find('title') is not None else ''
-                    link = item.find('link').text if item.find('link') is not None else ''
-                    if title and link:
-                        news_list.append({'title': title, 'link': link})
+                for item in root.findall('.//item')[:limit]:
+                    # 구글 뉴스 제목 끝에 붙는 언론사 이름 제거 (예: - Yahoo Finance)
+                    raw_title = item.find('title').text
+                    title = raw_title.split(' - ')[0] if ' - ' in raw_title else raw_title
+                    link = item.find('link').text
+                    news_list.append({'title': title, 'link': link})
         except Exception as e:
-            write_log(f"RSS 크롤링 실패 ({ticker}): {e}")
-            
+            write_log(f"구글 뉴스 RSS 실패 ({ticker}): {e}")
+
     return news_list
 
 # ---------------------------------------------------------
@@ -247,12 +258,12 @@ def start_background_worker():
             bot = telebot.TeleBot(token)
             last_weekly_sent = None
             last_daily_sent = None
-            try: bot.send_message(chat_id, "🤖 DeBrief V57 가동\n강력한 뉴스 이중 백업 시스템 적용 완료.")
+            try: bot.send_message(chat_id, "🤖 DeBrief V58 가동\n방탄(Bulletproof) 뉴스 수집기 적용 완료.")
             except: pass
 
             @bot.message_handler(commands=['start', 'help'])
             def start_cmd(m): 
-                msg = ("🤖 *DeBrief V57*\n"
+                msg = ("🤖 *DeBrief V58*\n"
                        "/on : 시스템 켜기\n"
                        "/off : 시스템 끄기\n"
                        "/earning [티커] : 실적발표\n"
@@ -363,8 +374,8 @@ def start_background_worker():
                     t = m.text.split()[1].upper()
                     bot.send_chat_action(m.chat.id, 'typing')
                     
-                    # [적용] 이중 백업 뉴스 함수 호출
-                    news_items = get_yahoo_news_list(t, limit=5)
+                    # 방탄 뉴스 함수 호출
+                    news_items = get_bulletproof_news(t, limit=5)
                     
                     if not news_items: return bot.reply_to(m, "최근 뉴스를 찾을 수 없습니다.")
                     
@@ -488,13 +499,13 @@ def start_background_worker():
                     if settings.get('📈 급등락(3%)') and abs(pct_change) >= 3.0:
                         last_pct = price_alert_cache.get(ticker, 0)
                         
-                        # 기존 알림 대비 추가로 1% 이상 더 변동했을 때만 재발송 (도배 방지)
+                        # 기존 알림 대비 추가로 1% 이상 더 변동했을 때만 재발송
                         if abs(pct_change - last_pct) >= 1.0:
                             price_alert_cache[ticker] = pct_change
                             
-                            # [적용] 재료(뉴스) 즉시 검색 및 번역 (이중 백업 로직)
+                            # 방탄 로직으로 뉴스 즉시 검색 (가장 최근 1개)
                             news_text = "관련 뉴스를 찾을 수 없습니다. (수급/커뮤니티 이슈 가능성)"
-                            news_items = get_yahoo_news_list(ticker, limit=1)
+                            news_items = get_bulletproof_news(ticker, limit=1)
                             
                             if news_items:
                                 raw_title = news_items[0]['title']
@@ -505,7 +516,7 @@ def start_background_worker():
                                     translated_title = translator.translate(raw_title)
                                 except Exception as e:
                                     write_log(f"번역 실패: {e}")
-                                    translated_title = raw_title # 번역 서버 오류 시 영어 원문 발송
+                                    translated_title = raw_title
                                     
                                 news_text = f"[{translated_title}]({link})"
 
@@ -610,7 +621,7 @@ with st.sidebar:
         st.error("⛔ Paused"); config['system_active'] = False
     save_config(config)
 
-st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V57)</h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='color: #1A73E8;'>📡 DeBrief Cloud (V58)</h3>", unsafe_allow_html=True)
 t1, t2, t3 = st.tabs(["📊 Dashboard", "⚙️ Management", "📜 Logs"])
 
 with t1:
